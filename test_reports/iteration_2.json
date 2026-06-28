@@ -1,0 +1,33 @@
+{
+  "summary": "Re-test verifying the execute_alert() duplicate-execution guard fix. Existing 25 pytest cases still pass. Added 4 new regression tests in TestWebhookFlow covering: (a) double-approve on the same alert returns HTTP 400 and creates exactly ONE bot trade (no duplicate); (b) reject-then-approve returns 400 and creates zero bot trades; (c) auto_execute webhook creates exactly one bot trade per alert; (d) auto_approve_timer creates exactly one bot trade after the timer elapses. All 29/29 backend tests pass on the public REACT_APP_BACKEND_URL. Smoke check passed for auth (login + /me + invalid creds), strategies (CRUD + computed metrics + webhook_url), trades CRUD with PnL math (long/short/option *100 multiplier), tags CRUD, analytics (overview, equity-curve, calendar, by/symbol|strategy|tag|side, mfe-mae, time-of-day, strategy-comparison), bot status + mode toggle, and settings GET/PUT.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_tradehub_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "execute_alert() guard is now correctly tightened: `if not alert or alert['status'] not in ('pending','approved'): return` — verified by new tests that a 2nd approve does not produce a duplicate trade.",
+    "approve_alert() still gates by `alert['status'] != 'pending'` which combined with the inner guard means the only legal entrypoints to executing an alert are: pending->approved transition via approve_alert OR auto_approve_timer OR auto_execute webhook. Safe.",
+    "Minor (pre-existing, not in scope): auto_approve_timer uses in-process asyncio.create_task — alerts pending at restart will never auto-execute. Recommend startup-recovery scan.",
+    "Minor (pre-existing): server.py is 884 lines; consider modularising."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_tradehub_api.py (added 4 regression tests in TestWebhookFlow)"
+  ],
+  "success_rate": {"backend": "100% (29/29)", "frontend": "skipped per request"},
+  "test_credentials": "trader@tradehub.io / trade1234 (from /app/memory/test_credentials.md; also exported via ADMIN_EMAIL/ADMIN_PASSWORD)",
+  "seed_data_creation": "No new permanent seed data. Each new test creates a TEST_WH_* strategy + 1 alert + 1 trade then deletes the strategy. Trades remain in DB with symbols DUPCHK, REJCHK (0 trades), ONECHK, TMRCHK — left as test residue but isolated under unique symbols.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite at /app/backend/tests/test_tradehub_api.py now has 29 tests. The duplicate-execution guard fix is verified end-to-end. To rerun: `REACT_APP_BACKEND_URL=<url> pytest backend/tests/test_tradehub_api.py -v`. IBKR live execution is MOCKED via paper-simulation fallback (expected). Telegram/Discord/Twilio outbound is MOCKED — notifications log 'failed' without creds (expected, not a bug).",
+  "rca of the issue": "Previous code review flagged that execute_alert() could fall through when alert['status'] was not in ('pending','approved'). The fix replaces the ambiguous guard with `if not alert or alert['status'] not in ('pending','approved'): return`. Verified by test_double_approve_returns_400_no_duplicate_trade: after first approve flips status to 'executed', a second approve hits approve_alert's `status != 'pending'` 400-check, and even if execute_alert were called directly with an executed alert, the new guard would return without creating a trade. Trade count for the alert_id remains exactly 1."
+}

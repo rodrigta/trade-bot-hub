@@ -267,8 +267,7 @@ async def execute_via_ibkr(alert: dict, ibkr_cfg: dict) -> dict:
 async def execute_alert(alert_id: str):
     alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
     if not alert or alert["status"] not in ("pending", "approved"):
-        if not alert:
-            return
+        return
     strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
     settings = await get_settings()
     result = await execute_via_ibkr(alert, settings.get("ibkr", {}))

@@ -12,8 +12,8 @@ if not BASE_URL:
     # Fallback to internal in case env not loaded for pytest CLI
     BASE_URL = "http://localhost:8001"
 
-EMAIL = "trader@tradehub.io"
-PASSWORD = "trade1234"
+EMAIL = os.environ.get("ADMIN_EMAIL", "trader@tradehub.io")
+PASSWORD = os.environ.get("ADMIN_PASSWORD", "trade1234")
 
 
 # --- Fixtures ---------------------------------------------------------------
@@ -195,6 +195,96 @@ class TestWebhookFlow:
         r = requests.post(f"{BASE_URL}/api/webhook/bogus_token",
                           json={"action": "buy", "symbol": "X"})
         assert r.status_code == 404
+
+    # --- Regression: duplicate-execution guard in execute_alert() -----------
+    def test_double_approve_returns_400_no_duplicate_trade(self, client):
+        """Approving an already-approved/executed alert must 400 and NOT
+        create a second bot trade for the same alert_id."""
+        s = self._make_strategy(client, "require_approval")
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "buy", "symbol": "DUPCHK", "quantity": 2, "price": 77.0},
+                timeout=20)
+            assert r.json()["status"] == "pending_approval"
+            aid = r.json()["alert_id"]
+
+            # First approve -> executed
+            r1 = client.post(f"{BASE_URL}/api/alerts/{aid}/approve")
+            assert r1.status_code == 200
+            assert r1.json()["status"] == "executed"
+
+            # Second approve -> must 400 because status is no longer 'pending'
+            r2 = client.post(f"{BASE_URL}/api/alerts/{aid}/approve")
+            assert r2.status_code == 400, f"expected 400, got {r2.status_code}: {r2.text}"
+
+            # Verify exactly ONE trade exists for this alert_id
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=DUPCHK").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 1, f"expected exactly 1 trade for alert {aid}, found {len(linked)}"
+            assert linked[0]["source"] == "bot"
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+    def test_reject_then_approve_returns_400_no_trade(self, client):
+        """A rejected alert must not be approvable and must have no bot trade."""
+        s = self._make_strategy(client, "require_approval")
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "sell", "symbol": "REJCHK", "quantity": 1, "price": 12.0},
+                timeout=20)
+            aid = r.json()["alert_id"]
+
+            rj = client.post(f"{BASE_URL}/api/alerts/{aid}/reject")
+            assert rj.status_code == 200
+            assert rj.json()["status"] == "rejected"
+
+            # Approving a rejected alert must 400
+            ap = client.post(f"{BASE_URL}/api/alerts/{aid}/approve")
+            assert ap.status_code == 400, ap.text
+
+            # No bot trade should exist for this alert_id
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=REJCHK").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 0
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+    def test_auto_execute_creates_exactly_one_trade(self, client):
+        """auto_execute webhook must create exactly one bot trade for the alert."""
+        s = self._make_strategy(client, "auto_execute")
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "buy", "symbol": "ONECHK", "quantity": 4, "price": 33.0},
+                timeout=20)
+            assert r.json()["status"] == "executed"
+            aid = r.json()["alert_id"]
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=ONECHK").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 1
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+    def test_auto_approve_timer_creates_exactly_one_trade(self, client):
+        """auto_approve_timer must auto-execute exactly once."""
+        s = self._make_strategy(client, "auto_approve_timer", secs=2)
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "buy", "symbol": "TMRCHK", "quantity": 1, "price": 19.0},
+                timeout=20)
+            aid = r.json()["alert_id"]
+            time.sleep(4)
+            alerts = client.get(f"{BASE_URL}/api/alerts").json()
+            target = next((a for a in alerts if a["id"] == aid), None)
+            assert target and target["status"] == "executed"
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=TMRCHK").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 1
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
 
 
 # --- Trades / Journal -------------------------------------------------------
