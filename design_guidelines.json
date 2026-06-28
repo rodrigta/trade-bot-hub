@@ -1,0 +1,109 @@
+{
+  "project_name": "TradeHub",
+  "theme_and_archetype": {
+    "theme": "dark",
+    "archetype": "Archetype 2 (Performance Pro)",
+    "rationale": "High energy, command-center feel tailored for a single active trader needing precise, fast data."
+  },
+  "typography": {
+    "heading_font": "Barlow Condensed",
+    "body_font": "DM Sans",
+    "mono_font": "JetBrains Mono",
+    "scales": {
+      "h1": "text-4xl sm:text-5xl font-black tracking-tighter",
+      "h2": "text-2xl sm:text-3xl font-bold tracking-tight",
+      "h3": "text-xl sm:text-2xl font-bold",
+      "h4": "text-lg font-semibold",
+      "body": "text-sm sm:text-base leading-relaxed tracking-wide",
+      "metrics": "text-2xl sm:text-3xl font-bold tracking-tight font-mono",
+      "labels": "text-xs font-bold uppercase tracking-[0.2em] text-white/50"
+    }
+  },
+  "colors": {
+    "background": {
+      "app_base": "#0A0A0A",
+      "card_surface": "#141414",
+      "hover_state": "#1F1F1F"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A1A1AA",
+      "muted": "#71717A"
+    },
+    "accents": {
+      "primary_action": "#007AFF",
+      "hover_action": "#3395FF"
+    },
+    "status": {
+      "profit_green": "#10B981",
+      "loss_red": "#EF4444",
+      "warning_amber": "#F59E0B",
+      "pending_blue": "#3B82F6"
+    },
+    "borders": {
+      "subtle": "rgba(255, 255, 255, 0.1)",
+      "focus": "#007AFF"
+    }
+  },
+  "layout_and_spacing": {
+    "strategy": "The 'Control Room' Grid",
+    "navigation": "Collapsible left sidebar (256px expanded, 64px collapsed).",
+    "grid_system": "12-column CSS Grid. Use col-span-3 or col-span-4 for metric cards, col-span-full for data tables.",
+    "spacing_rules": "Prioritize density. Tight gaps (gap-4) for widgets. Generous padding only in empty states.",
+    "alignment": "Right-align all financial numbers/metrics. Left-align text. Center-align status badges."
+  },
+  "surface_strategies": {
+    "cards_and_widgets": "Flat solid background (#141414). 1px subtle inner stroke (border-white/10). No soft shadows. Sharp or slightly rounded edges (max 4px).",
+    "headers": "Crystal Glass style: backdrop-blur-xl bg-[#0A0A0A]/70 with 1px border-white/10 on the bottom.",
+    "inputs_and_forms": "Solid dark background, 1px border, stark white text, strong focus ring (ring-2 ring-[#007AFF])."
+  },
+  "components": {
+    "data_tables": "Sticky headers, frozen leftmost column. Row hover states (bg-[#1F1F1F]). High density (py-2 or py-3).",
+    "strategy_cards": "Top status badge, internal metrics grid, strict alignment. 1px border default, bright border on hover.",
+    "approval_center": "Prominent countdown timers using Monospace font. Red text when <10s. Large, high-contrast Approve/Reject buttons.",
+    "calendar_pl": "Grid layout. Cells colored conditionally based on daily profit/loss (Tinted green vs tinted red backgrounds with clear text).",
+    "tag_chips": "Small, uppercase, color-coded based on tag type. Text size xs."
+  },
+  "motion": {
+    "transitions": "transition-all duration-200 ease-out",
+    "hover_states": "Slight lift (-translate-y-[2px]) on cards, border color brightens.",
+    "micro_interactions": "Pulse effect on pending approval countdowns when < 10 seconds."
+  },
+  "icons_and_assets": {
+    "icon_library": "@phosphor-icons/react",
+    "icon_style": "Sharp, technical, duotone or bold depending on emphasis. Provide installation command: yarn add @phosphor-icons/react"
+  },
+  "testing": {
+    "requirement": "All interactive and key informational elements MUST include a 'data-testid' attribute.",
+    "format": "kebab-case, role-based",
+    "examples": [
+      "data-testid='approve-trade-button'",
+      "data-testid='strategy-card-item'",
+      "data-testid='pl-metric-value'"
+    ]
+  },
+  "media": {
+    "images": [
+      {
+        "url": "https://images.pexels.com/photos/12627677/pexels-photo-12627677.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Vivid dark abstract geometric shapes - Use for login background or empty state hero.",
+        "category": "background"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1745270917331-787c80129680?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzF8MHwxfHNlYXJjaHwyfHx0cmFkaW5nJTIwc2V0dXAlMjBzY3JlZW58ZW58MHx8fHwxNzgyNjExOTQ4fDA&ixlib=rb-4.1.0&q=85",
+        "description": "Stock market graph - Use for placeholder visuals in analysis empty states.",
+        "category": "placeholder"
+      }
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the color palette. Do NOT use Tailwind default blue/green, use the exact hex codes via arbitrary values or tailwind config.",
+    "Prioritize data density. Do not use excessive padding in tables or lists.",
+    "Implement 'data-testid' on all interactive elements.",
+    "Use Shadcn UI components (.js files) but strip away the soft 'Vercel' look. Make them sharp, dark, and tactical.",
+    "For the Strategy Manager and Trade Journal, use complex responsive grids.",
+    "Ensure the countdown timer in the Approval Center uses JetBrains Mono or a similar tabular figures font to avoid jittering.",
+    "Do NOT use HTML-based components for advanced user interactions; use Shadcn.",
+    "Remember to load the specified Google Fonts (Barlow Condensed, DM Sans, JetBrains Mono) in the document head or via CSS imports."
+  ]
+}
