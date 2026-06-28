@@ -67,9 +67,9 @@ export default function Analysis() {
         <Tabs defaultValue="calendar">
           <TabsList className="bg-card border border-border flex-wrap h-auto">
             <TabsTrigger value="calendar" data-testid="tab-calendar">Calendar</TabsTrigger>
-            <TabsTrigger value="equity">Equity & Drawdown</TabsTrigger>
-            <TabsTrigger value="breakdown">Breakdowns</TabsTrigger>
-            <TabsTrigger value="mfe">MFE / MAE</TabsTrigger>
+            <TabsTrigger value="equity" data-testid="tab-equity">Equity & Drawdown</TabsTrigger>
+            <TabsTrigger value="breakdown" data-testid="tab-breakdown">Breakdowns</TabsTrigger>
+            <TabsTrigger value="mfe" data-testid="tab-mfe">MFE / MAE</TabsTrigger>
             <TabsTrigger value="strategies" data-testid="tab-strategies">Strategy Compare</TabsTrigger>
           </TabsList>
 
