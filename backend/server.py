@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any
 import logging
 import uuid
 import random
+import secrets
 import asyncio
 import string
 from datetime import datetime, timezone, timedelta
@@ -65,7 +66,7 @@ def create_token(user_id: str, email: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 def gen_webhook_token() -> str:
-    return "strat_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    return "strat_" + "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(12))
 
 async def get_current_user(request: Request) -> dict:
     auth = request.headers.get("Authorization", "")

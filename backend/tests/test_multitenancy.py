@@ -7,6 +7,7 @@ import requests
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/") or "http://localhost:8001"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "trader@tradehub.io")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "trade1234")
+TEST_PW = os.environ.get("TEST_USER_PASSWORD") or (uuid.uuid4().hex + "aA1!")
 
 
 def _login(email, password):
@@ -32,7 +33,7 @@ def admin_token():
 def fresh_user(admin_token):
     """Register a fresh test user. Cleaned up via admin DELETE at teardown."""
     email = f"qauser+{uuid.uuid4().hex[:8]}@example.com"
-    password = "Passw0rd!"
+    password = TEST_PW
     r = requests.post(f"{BASE_URL}/api/auth/register",
                       json={"name": "QA User", "email": email, "password": password},
                       timeout=20)
@@ -150,7 +151,7 @@ class TestAdminUserManagement:
     def test_admin_create_user(self, admin_token):
         email = f"qauser+admincreate{uuid.uuid4().hex[:6]}@example.com"
         r = requests.post(f"{BASE_URL}/api/users", headers=_hdr(admin_token),
-                          json={"name": "AdminMade", "email": email, "password": "Passw0rd!"})
+                          json={"name": "AdminMade", "email": email, "password": TEST_PW})
         assert r.status_code == 200
         uid = r.json()["id"]
         assert r.json()["is_admin"] is False
@@ -162,7 +163,7 @@ class TestAdminUserManagement:
         # Register a user
         email = f"qauser+deltest{uuid.uuid4().hex[:6]}@example.com"
         reg = requests.post(f"{BASE_URL}/api/auth/register",
-                            json={"name": "Del", "email": email, "password": "Passw0rd!"})
+                            json={"name": "Del", "email": email, "password": TEST_PW})
         assert reg.status_code == 200
         uid = reg.json()["user"]["id"]
         utok = reg.json()["token"]
@@ -177,7 +178,7 @@ class TestAdminUserManagement:
         d = requests.delete(f"{BASE_URL}/api/users/{uid}", headers=_hdr(admin_token))
         assert d.status_code == 200
         # Try login → 401
-        r = _login(email, "Passw0rd!")
+        r = _login(email, TEST_PW)
         assert r.status_code == 401
 
     def test_admin_cannot_delete_self(self, admin_token):
