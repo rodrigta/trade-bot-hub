@@ -33,6 +33,17 @@ def client(token):
     return s
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _enable_auto_trade_for_session(client):
+    """The master Auto-Trade switch defaults to OFF; existing tests here assume
+    auto_execute webhooks execute immediately, so enable it for the session and
+    reset to OFF on teardown (per the new gating contract)."""
+    client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": True})
+    yield
+    client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
+    client.post(f"{BASE_URL}/api/bot/broker", json={"connected": False})
+
+
 # --- Auth -------------------------------------------------------------------
 class TestAuth:
     def test_login_success(self):
@@ -110,6 +121,12 @@ class TestStrategies:
 
 # --- Webhook + Approval flow ------------------------------------------------
 class TestWebhookFlow:
+    @pytest.fixture(autouse=True)
+    def _autotrade_on(self, client):
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": True})
+        client.post(f"{BASE_URL}/api/bot/mode", json={"live": False})
+        yield
+
     def _make_strategy(self, client, mode, secs=2):
         payload = {"name": f"TEST_WH_{mode}", "approval_mode": mode,
                    "auto_approve_seconds": secs, "asset_type": "stock",
@@ -289,6 +306,11 @@ class TestWebhookFlow:
 
 # --- Notification independence (decoupled from execution) ------------------
 class TestNotificationIndependence:
+    @pytest.fixture(autouse=True)
+    def _autotrade_on(self, client):
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": True})
+        yield
+
     def _make_strategy(self, client, mode, platforms=None, secs=2):
         payload = {"name": f"TEST_NI_{mode}", "approval_mode": mode,
                    "auto_approve_seconds": secs, "asset_type": "stock",
@@ -554,3 +576,283 @@ class TestSettings:
         assert u.status_code == 200
         g = client.get(f"{BASE_URL}/api/settings").json()
         assert g["telegram"]["bot_token"] == "x"
+
+
+# ===========================================================================
+# NEW-FEATURE TESTS (merged into this module so pytest-xdist loadscope pins
+# them to the same worker as the existing tests — global /api/settings state
+# is shared, so serial-per-module execution avoids cross-test contamination).
+# ===========================================================================
+def _mk_strategy(client, mode="auto_execute", platforms=None, name_suffix=""):
+    payload = {
+        "name": f"TEST_NF_{mode}_{name_suffix}",
+        "approval_mode": mode,
+        "auto_approve_seconds": 2,
+        "asset_type": "stock",
+        "message_template": "{action} {symbol} @ {price}",
+        "notify_platforms": platforms or [],
+        "active": True,
+        "order_defaults": {"order_type": "market", "quantity": 1},
+    }
+    r = client.post(f"{BASE_URL}/api/strategies", json=payload)
+    assert r.status_code == 200
+    return r.json()
+
+
+class TestAutoTradeGating:
+    def test_default_status_flags(self, client):
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
+        client.post(f"{BASE_URL}/api/bot/broker", json={"connected": False})
+        r = client.get(f"{BASE_URL}/api/bot/status")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["auto_trade_enabled"] is False
+        assert d["broker_connected"] is False
+
+    def test_auto_execute_held_when_auto_trade_off(self, client):
+        # ensure OFF
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
+        s = _mk_strategy(client, "auto_execute", platforms=["telegram"], name_suffix="held")
+        try:
+            r = requests.post(f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                              json={"action": "buy", "symbol": "HELDX", "quantity": 1, "price": 10.0},
+                              timeout=20)
+            assert r.status_code == 200
+            body = r.json()
+            assert body["status"] == "pending_approval"
+            aid = body["alert_id"]
+
+            # zero trades
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=HELDX").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 0
+
+            # approval notif logged
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            rows = [n for n in notifs if n.get("alert_id") == aid
+                    and n.get("message", "").startswith("🔔 APPROVAL NEEDED:")]
+            assert len(rows) >= 1
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+    def test_auto_execute_runs_when_auto_trade_on(self, client):
+        r = client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": True})
+        assert r.status_code == 200 and r.json()["auto_trade_enabled"] is True
+        s = _mk_strategy(client, "auto_execute", platforms=["telegram"], name_suffix="run")
+        try:
+            r = requests.post(f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                              json={"action": "buy", "symbol": "RUNX", "quantity": 2, "price": 20.0},
+                              timeout=20)
+            assert r.status_code == 200
+            body = r.json()
+            assert body["status"] == "executed"
+            aid = body["alert_id"]
+
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=RUNX").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 1
+
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            rel = [n for n in notifs if n.get("alert_id") == aid]
+            signal_rows = [n for n in rel if n["message"].startswith("⚡ SIGNAL:")
+                           and n.get("event") == "signal"]
+            fill_rows = [n for n in rel if n["message"].startswith("✅ ORDER FILLED")
+                         and n.get("event") == "order_success"]
+            assert len(signal_rows) >= 1, "expected ⚡ SIGNAL notif with event=signal"
+            assert len(fill_rows) >= 1, "expected ✅ ORDER FILLED notif with event=order_success"
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+            client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
+
+
+# ---------------------------------------------------------------------------
+# 2. Broker connect/disconnect
+# ---------------------------------------------------------------------------
+class TestBrokerConnect:
+    def test_connect_disconnect_persists_host_port(self, client):
+        # first set auto_trade + some settings we want preserved
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": True})
+        client.put(f"{BASE_URL}/api/settings",
+                   json={"telegram": {"personal": {"enabled": True, "bot_token": "pTok", "chat_id": "111"}},
+                         "discord": {}, "whatsapp": {},
+                         "ibkr": {}, "auto_trade_enabled": True})
+
+        r = client.post(f"{BASE_URL}/api/bot/broker",
+                        json={"connected": True, "host": "192.168.99.5", "port": 4001})
+        assert r.status_code == 200
+        assert r.json()["broker_connected"] is True
+
+        st = client.get(f"{BASE_URL}/api/bot/status").json()
+        assert st["broker_connected"] is True
+        assert st["host"] == "192.168.99.5"
+        assert st["port"] == 4001
+        # auto_trade preserved
+        assert st["auto_trade_enabled"] is True
+        # settings.telegram preserved
+        gs = client.get(f"{BASE_URL}/api/settings").json()
+        assert gs["telegram"]["personal"]["bot_token"] == "pTok"
+
+        # disconnect
+        r = client.post(f"{BASE_URL}/api/bot/broker", json={"connected": False})
+        assert r.status_code == 200 and r.json()["broker_connected"] is False
+        st = client.get(f"{BASE_URL}/api/bot/status").json()
+        assert st["broker_connected"] is False
+        # host/port and other settings still there
+        assert st["host"] == "192.168.99.5"
+        assert st["auto_trade_enabled"] is True
+
+        # cleanup
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
+
+
+# ---------------------------------------------------------------------------
+# 3. Per-platform event filtering
+# ---------------------------------------------------------------------------
+class TestEventFiltering:
+    def test_telegram_event_filter_excludes_and_includes_order_success(self, client):
+        # Setup: auto-trade ON so auto_execute fires; telegram configured with dummy creds.
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": True})
+        client.put(f"{BASE_URL}/api/settings", json={
+            "telegram": {
+                "personal": {"enabled": True, "bot_token": "dummy", "chat_id": "999"},
+                "events": ["signal"],  # only signal, no order_success
+            },
+            "discord": {}, "whatsapp": {},
+            "ibkr": {}, "auto_trade_enabled": True,
+        })
+        s = _mk_strategy(client, "auto_execute", platforms=["telegram"], name_suffix="evfilt1")
+        try:
+            r = requests.post(f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                              json={"action": "buy", "symbol": "EVFLT1", "quantity": 1, "price": 5.0},
+                              timeout=20)
+            aid = r.json()["alert_id"]
+            time.sleep(0.5)
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            rel = [n for n in notifs if n.get("alert_id") == aid and n["platform"] == "telegram"]
+            signal_rows = [n for n in rel if n.get("event") == "signal"]
+            success_rows = [n for n in rel if n.get("event") == "order_success"]
+            assert len(signal_rows) >= 1, "expected telegram signal row"
+            assert len(success_rows) == 0, f"expected NO telegram order_success row, got {len(success_rows)}"
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+        # Now include order_success and re-fire.
+        client.put(f"{BASE_URL}/api/settings", json={
+            "telegram": {
+                "personal": {"enabled": True, "bot_token": "dummy", "chat_id": "999"},
+                "events": ["signal", "order_success"],
+            },
+            "discord": {}, "whatsapp": {},
+            "ibkr": {}, "auto_trade_enabled": True,
+        })
+        s2 = _mk_strategy(client, "auto_execute", platforms=["telegram"], name_suffix="evfilt2")
+        try:
+            r = requests.post(f"{BASE_URL}/api/webhook/{s2['webhook_token']}",
+                              json={"action": "buy", "symbol": "EVFLT2", "quantity": 1, "price": 5.0},
+                              timeout=20)
+            aid = r.json()["alert_id"]
+            time.sleep(0.5)
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            rel = [n for n in notifs if n.get("alert_id") == aid and n["platform"] == "telegram"]
+            success_rows = [n for n in rel if n.get("event") == "order_success"]
+            assert len(success_rows) >= 1, "expected telegram order_success row now that it's opted in"
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s2['id']}")
+            client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
+
+
+# ---------------------------------------------------------------------------
+# 4. Telegram personal + group
+# ---------------------------------------------------------------------------
+class TestTelegramPersonalGroup:
+    def test_two_targets_produce_two_rows(self, client):
+        client.put(f"{BASE_URL}/api/settings", json={
+            "telegram": {
+                "personal": {"enabled": True, "bot_token": "x", "chat_id": "111"},
+                "group":    {"enabled": True, "bot_token": "y", "chat_id": "-100222"},
+            },
+            "discord": {}, "whatsapp": {}, "ibkr": {}, "auto_trade_enabled": False,
+        })
+        r = client.post(f"{BASE_URL}/api/notifications/test", json={"platform": "telegram"})
+        assert r.status_code == 200
+        time.sleep(0.3)
+        notifs = client.get(f"{BASE_URL}/api/notifications").json()
+        # Find the two most recent telegram test rows
+        tg_test = [n for n in notifs if n["platform"] == "telegram" and n.get("event") == "test"]
+        assert len(tg_test) >= 2
+        # Look within top-6 to find the pair produced by this call
+        recent = tg_test[:6]
+        targets = {n.get("target") for n in recent}
+        assert "personal" in targets and "group" in targets, f"targets seen: {targets}"
+
+
+# ---------------------------------------------------------------------------
+# 5. /api/notifications/test endpoint
+# ---------------------------------------------------------------------------
+class TestNotificationsTestEndpoint:
+    @pytest.mark.parametrize("platform", ["discord", "whatsapp"])
+    def test_not_configured_returns_ok_false_and_logs_row(self, client, platform):
+        # clear out that platform's config
+        client.put(f"{BASE_URL}/api/settings", json={
+            "telegram": {}, "discord": {}, "whatsapp": {},
+            "ibkr": {}, "auto_trade_enabled": False,
+        })
+        r = client.post(f"{BASE_URL}/api/notifications/test", json={"platform": platform})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        # detail contains not_configured error
+        detail = body["detail"]
+        # discord returns dict; telegram returns list; whatsapp returns dict
+        if isinstance(detail, list):
+            assert any((d.get("error") == "not_configured") for d in detail)
+        else:
+            assert detail.get("error") == "not_configured"
+
+        time.sleep(0.2)
+        notifs = client.get(f"{BASE_URL}/api/notifications").json()
+        test_rows = [n for n in notifs if n["platform"] == platform and n.get("event") == "test"]
+        assert len(test_rows) >= 1
+
+    def test_telegram_not_configured(self, client):
+        client.put(f"{BASE_URL}/api/settings", json={
+            "telegram": {}, "discord": {}, "whatsapp": {},
+            "ibkr": {}, "auto_trade_enabled": False,
+        })
+        r = client.post(f"{BASE_URL}/api/notifications/test", json={"platform": "telegram"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 6. Settings persistence
+# ---------------------------------------------------------------------------
+class TestSettingsPersistence:
+    def test_full_roundtrip(self, client):
+        payload = {
+            "telegram": {
+                "events": ["signal", "order_failure"],
+                "personal": {"enabled": True, "bot_token": "tp", "chat_id": "1"},
+                "group": {"enabled": True, "bot_token": "tg", "chat_id": "-99"},
+            },
+            "discord": {"events": ["signal"], "chat_type": "personal", "webhook_url": "https://x"},
+            "whatsapp": {"events": ["order_success"], "account_sid": "sid",
+                         "auth_token": "tok", "from_number": "whatsapp:+1", "to_number": "whatsapp:+2"},
+            "ibkr": {"host": "10.0.0.1", "port": 7497, "enabled": False},
+            "auto_trade_enabled": True,
+        }
+        u = client.put(f"{BASE_URL}/api/settings", json=payload)
+        assert u.status_code == 200
+        g = client.get(f"{BASE_URL}/api/settings").json()
+
+        assert g["telegram"]["personal"]["bot_token"] == "tp"
+        assert g["telegram"]["group"]["chat_id"] == "-99"
+        assert g["telegram"]["events"] == ["signal", "order_failure"]
+        assert g["discord"]["chat_type"] == "personal"
+        assert g["discord"]["events"] == ["signal"]
+        assert g["whatsapp"]["events"] == ["order_success"]
+        assert g["ibkr"]["host"] == "10.0.0.1"
+        assert g["auto_trade_enabled"] is True
+
+        # cleanup: reset auto_trade
+        client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})

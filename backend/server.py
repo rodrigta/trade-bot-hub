@@ -141,6 +141,7 @@ class SettingsIn(BaseModel):
     discord: Dict[str, Any] = {}
     whatsapp: Dict[str, Any] = {}
     ibkr: Dict[str, Any] = {}
+    auto_trade_enabled: bool = False
 
 # ----------------------------------------------------------------------------
 # P&L computation
@@ -163,14 +164,13 @@ def compute_pnl(t: dict) -> dict:
 # ----------------------------------------------------------------------------
 # Notifications (outbound)
 # ----------------------------------------------------------------------------
+DEFAULT_EVENTS = ["signal", "order_success", "order_failure"]
+
 async def get_settings() -> dict:
     s = await db.settings.find_one({"id": "global"}, {"_id": 0})
-    return s or {"telegram": {}, "discord": {}, "whatsapp": {}, "ibkr": {}}
+    return s or {"telegram": {}, "discord": {}, "whatsapp": {}, "ibkr": {}, "auto_trade_enabled": False}
 
-async def send_telegram(text: str, alert_id: str, tg: dict, with_actions: bool = True) -> dict:
-    token, chat = tg.get("bot_token"), tg.get("chat_id")
-    if not token or not chat:
-        return {"ok": False, "error": "not_configured"}
+async def _tg_send(token: str, chat: str, text: str, alert_id: str, with_actions: bool) -> dict:
     payload = {"chat_id": chat, "text": text}
     if with_actions:
         payload["reply_markup"] = {"inline_keyboard": [[
@@ -180,9 +180,27 @@ async def send_telegram(text: str, alert_id: str, tg: dict, with_actions: bool =
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
-            return {"ok": r.status_code == 200, "status": r.status_code}
+            ok = r.status_code == 200
+            return {"ok": ok, "status": r.status_code, "detail": (None if ok else r.text[:300])}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+async def send_telegram(text: str, alert_id: str, tg: dict, with_actions: bool = True) -> list:
+    """Send to every configured Telegram target (personal and/or group). Each
+    target has its own bot token, so a dedicated bot can be used per chat type.
+    Falls back to a flat bot_token/chat_id for backward compatibility."""
+    results = []
+    for kind in ("personal", "group"):
+        t = tg.get(kind) or {}
+        if t.get("enabled") and t.get("bot_token") and t.get("chat_id"):
+            r = await _tg_send(t["bot_token"], t["chat_id"], text, alert_id, with_actions)
+            results.append({"target": kind, **r})
+    if not results and tg.get("bot_token") and tg.get("chat_id"):
+        r = await _tg_send(tg["bot_token"], tg["chat_id"], text, alert_id, with_actions)
+        results.append({"target": "default", **r})
+    if not results:
+        results.append({"target": "telegram", "ok": False, "error": "not_configured"})
+    return results
 
 async def send_discord(text: str, dc: dict) -> dict:
     url = dc.get("webhook_url")
@@ -208,27 +226,34 @@ async def send_whatsapp(text: str, wa: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-async def dispatch_notifications(strategy: dict, alert: dict, with_actions: bool = True, prefix: str = ""):
-    """Send the signal notification to all configured platforms. This runs
-    independently of (and before) order execution, so a notification is always
-    delivered even if the order later fails to fill."""
+async def _log_notif(alert, strategy, platform, msg, event, res, target=None):
+    await db.notifications.insert_one({
+        "id": new_id(), "alert_id": alert.get("id"), "strategy_id": strategy.get("id"),
+        "platform": platform, "target": target, "event": event, "message": msg,
+        "status": "delivered" if res.get("ok") else "failed",
+        "detail": res, "response": None, "sent_at": now_iso(), "responded_at": None,
+    })
+
+async def dispatch_notifications(strategy: dict, alert: dict, event: str = "signal",
+                                 with_actions: bool = True, prefix: str = ""):
+    """Send a notification to all configured platforms. Runs independently of
+    order execution. Each platform only receives events it opted into
+    (signal / order_success / order_failure)."""
     settings = await get_settings()
     msg = (prefix + render_template(strategy.get("message_template", ""), alert)).strip()
-    platforms = strategy.get("notify_platforms", [])
-    for plat in platforms:
+    for plat in strategy.get("notify_platforms", []):
+        cfg = settings.get(plat) or {}
+        if event not in (cfg.get("events") or DEFAULT_EVENTS):
+            continue
         if plat == "telegram":
-            res = await send_telegram(msg, alert["id"], settings.get("telegram", {}), with_actions=with_actions)
+            for r in await send_telegram(msg, alert["id"], cfg, with_actions):
+                await _log_notif(alert, strategy, "telegram", msg, event, r, r.get("target"))
         elif plat == "discord":
-            res = await send_discord(msg, settings.get("discord", {}))
+            r = await send_discord(msg, cfg)
+            await _log_notif(alert, strategy, "discord", msg, event, r, cfg.get("chat_type"))
         elif plat == "whatsapp":
-            res = await send_whatsapp(msg, settings.get("whatsapp", {}))
-        else:
-            res = {"ok": False, "error": "unknown"}
-        await db.notifications.insert_one({
-            "id": new_id(), "alert_id": alert["id"], "strategy_id": strategy["id"],
-            "platform": plat, "message": msg, "status": "delivered" if res.get("ok") else "failed",
-            "detail": res, "response": None, "sent_at": now_iso(), "responded_at": None,
-        })
+            r = await send_whatsapp(msg, cfg)
+            await _log_notif(alert, strategy, "whatsapp", msg, event, r)
 
 def render_template(tpl: str, alert: dict) -> str:
     out = tpl
@@ -289,8 +314,8 @@ async def execute_alert(alert_id: str):
             "status": "failed", "failed_at": now_iso(), "execution": result}})
         strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
         if strategy:
-            await dispatch_notifications(strategy, alert, with_actions=False,
-                                         prefix="⚠️ ORDER FAILED: ")
+            await dispatch_notifications(strategy, alert, event="order_failure",
+                                         with_actions=False, prefix="⚠️ ORDER FAILED: ")
         return
 
     side = "long" if alert.get("action") in ("buy", "long") else "short"
@@ -312,6 +337,10 @@ async def execute_alert(alert_id: str):
     await db.alerts.update_one({"id": alert_id}, {"$set": {
         "status": "executed", "executed_at": now_iso(),
         "execution": result, "trade_id": trade["id"]}})
+    strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
+    if strategy:
+        await dispatch_notifications(strategy, alert, event="order_success", with_actions=False,
+                                     prefix=f"✅ ORDER FILLED @ {result['fill_price']}: ")
 
 async def auto_approve_timer(alert_id: str, seconds: int):
     await asyncio.sleep(seconds)
@@ -427,25 +456,35 @@ async def receive_webhook(token: str, request: Request):
         await db.alerts.insert_one({**alert})
         return {"status": "ignored", "reason": "strategy paused"}
 
+    settings = await get_settings()
+    auto_on = bool(settings.get("auto_trade_enabled"))
     mode = strategy.get("approval_mode", "auto_execute")
-    if mode == "auto_execute":
+
+    # Auto-execute only when the master Auto-Trade switch is ON.
+    if mode == "auto_execute" and auto_on:
         alert["status"] = "approved"
         await db.alerts.insert_one({**alert})
-        # Send the signal notification FIRST, independent of execution outcome.
-        await dispatch_notifications(strategy, alert, with_actions=False, prefix="⚡ SIGNAL: ")
+        # Signal notification FIRST, independent of execution outcome.
+        await dispatch_notifications(strategy, alert, event="signal", with_actions=False, prefix="⚡ SIGNAL: ")
         await execute_alert(alert["id"])
         return {"status": "executed", "alert_id": alert["id"]}
-    else:
-        alert["status"] = "pending"
-        if mode == "auto_approve_timer":
-            alert["auto_approve_at"] = (datetime.now(timezone.utc) +
-                                        timedelta(seconds=strategy.get("auto_approve_seconds", 30))).isoformat()
-            alert["auto_approve_seconds"] = strategy.get("auto_approve_seconds", 30)
-        await db.alerts.insert_one({**alert})
-        await dispatch_notifications(strategy, alert)
-        if mode == "auto_approve_timer":
-            asyncio.create_task(auto_approve_timer(alert["id"], strategy.get("auto_approve_seconds", 30)))
-        return {"status": "pending_approval", "alert_id": alert["id"]}
+
+    # Otherwise hold for manual approval: require_approval, or any auto mode
+    # while Auto-Trade is OFF (e.g. no broker connected).
+    alert["status"] = "pending"
+    schedule_timer = (mode == "auto_approve_timer" and auto_on)
+    if schedule_timer:
+        secs = strategy.get("auto_approve_seconds", 30)
+        alert["auto_approve_at"] = (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat()
+        alert["auto_approve_seconds"] = secs
+    if not auto_on and mode != "require_approval":
+        alert["held_reason"] = "auto_trade_disabled"
+    await db.alerts.insert_one({**alert})
+    await dispatch_notifications(strategy, alert, event="signal", with_actions=True,
+                                 prefix="🔔 APPROVAL NEEDED: ")
+    if schedule_timer:
+        asyncio.create_task(auto_approve_timer(alert["id"], strategy.get("auto_approve_seconds", 30)))
+    return {"status": "pending_approval", "alert_id": alert["id"]}
 
 @api.get("/alerts")
 async def list_alerts(status: Optional[str] = None, user: dict = Depends(get_current_user)):
@@ -481,17 +520,43 @@ async def reject_alert(aid: str, user: dict = Depends(get_current_user)):
 async def bot_status(user: dict = Depends(get_current_user)):
     settings = await get_settings()
     ibkr = settings.get("ibkr", {})
+    connected = bool(ibkr.get("enabled"))
+    auto_on = bool(settings.get("auto_trade_enabled"))
     recent = await db.alerts.find({}, {"_id": 0}).sort("received_at", -1).to_list(25)
     total = await db.alerts.count_documents({})
     executed = await db.alerts.count_documents({"status": "executed"})
     pending = await db.alerts.count_documents({"status": "pending"})
+    failed = await db.alerts.count_documents({"status": "failed"})
     return {
-        "ibkr_connected": bool(ibkr.get("enabled")),
-        "mode": "live" if ibkr.get("enabled") else "paper",
+        "auto_trade_enabled": auto_on,
+        "broker_connected": connected,
+        "ibkr_connected": connected,
+        "mode": "live" if connected else "paper",
         "host": ibkr.get("host", "127.0.0.1"), "port": ibkr.get("port", 7497),
         "recent_alerts": recent,
-        "stats": {"total": total, "executed": executed, "pending": pending},
+        "stats": {"total": total, "executed": executed, "pending": pending, "failed": failed},
     }
+
+@api.post("/bot/auto-trade")
+async def set_auto_trade(body: dict, user: dict = Depends(get_current_user)):
+    enabled = bool(body.get("enabled"))
+    await db.settings.update_one({"id": "global"}, {"$set": {"auto_trade_enabled": enabled}}, upsert=True)
+    return {"auto_trade_enabled": enabled}
+
+@api.post("/bot/broker")
+async def set_broker(body: dict, user: dict = Depends(get_current_user)):
+    """Connect/disconnect the broker. In this cloud env a live connection is
+    unreachable, so fills use the paper simulation until you self-host TWS/Gateway."""
+    connected = bool(body.get("connected"))
+    s = await get_settings()
+    ibkr = s.get("ibkr", {})
+    ibkr["enabled"] = connected
+    if body.get("host"):
+        ibkr["host"] = body["host"]
+    if body.get("port"):
+        ibkr["port"] = body["port"]
+    await db.settings.update_one({"id": "global"}, {"$set": {"ibkr": ibkr}}, upsert=True)
+    return {"broker_connected": connected, "host": ibkr.get("host"), "port": ibkr.get("port")}
 
 @api.post("/bot/mode")
 async def set_bot_mode(body: dict, user: dict = Depends(get_current_user)):
@@ -501,6 +566,32 @@ async def set_bot_mode(body: dict, user: dict = Depends(get_current_user)):
     ibkr["enabled"] = enabled
     await db.settings.update_one({"id": "global"}, {"$set": {"ibkr": ibkr}}, upsert=True)
     return {"mode": "live" if enabled else "paper"}
+
+@api.post("/notifications/test")
+async def test_notification(body: dict, user: dict = Depends(get_current_user)):
+    """Send a test message to a platform using the saved credentials, so you can
+    verify the integration end-to-end from the Settings page."""
+    platform = body.get("platform")
+    settings = await get_settings()
+    cfg = settings.get(platform) or {}
+    msg = f"🧪 TradeHub test — your {platform} notifications are working!"
+    if platform == "telegram":
+        results = await send_telegram(msg, "test", cfg, with_actions=False)
+        ok = any(r.get("ok") for r in results)
+        detail = results
+        for r in results:
+            await _log_notif({"id": "test"}, {"id": "test"}, "telegram", msg, "test", r, r.get("target"))
+    elif platform == "discord":
+        detail = await send_discord(msg, cfg)
+        ok = detail.get("ok")
+        await _log_notif({"id": "test"}, {"id": "test"}, "discord", msg, "test", detail, cfg.get("chat_type"))
+    elif platform == "whatsapp":
+        detail = await send_whatsapp(msg, cfg)
+        ok = detail.get("ok")
+        await _log_notif({"id": "test"}, {"id": "test"}, "whatsapp", msg, "test", detail)
+    else:
+        raise HTTPException(400, "Unknown platform")
+    return {"ok": bool(ok), "detail": detail}
 
 # ----------------------------------------------------------------------------
 # Trades (journal)

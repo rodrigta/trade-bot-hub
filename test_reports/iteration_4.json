@@ -1,0 +1,44 @@
+{
+  "summary": "Verified the 4 new features end-to-end: (1) Auto-Trade master switch gating auto_execute, (2) Broker connect/disconnect with host/port persistence, (3) Per-platform event filtering (signal/order_success/order_failure), (4) Telegram personal+group targets with separate bot tokens, (5) /api/notifications/test endpoint (returns ok:false + logs row when not_configured), (6) /api/settings round-trip preserving telegram.personal/group + per-platform events + discord.chat_type + ibkr + auto_trade_enabled. Added 10 new backend tests merged into test_tradehub_api.py (loadscope-pinned so they share a worker with dependent tests). Also patched existing TestWebhookFlow + TestNotificationIndependence classes with autouse fixtures that enable auto_trade before each test (since default is now OFF). Serial run (pytest -n 0): 42/43 PASS. Parallel run (default -n 2 --dist loadscope from backend/pytest.ini): 38/43 (5 failures ALL caused by cross-worker races on the shared global /api/settings + ibkr doc — see below). Frontend smoke-tested: Bot page auto-trade-toggle + connect-broker-btn + disconnect-broker-btn work; Notifications page has all required data-testids (tg-personal-enable, tg-group-enable, telegram/discord/whatsapp event chips, test-telegram/discord/whatsapp buttons, discord-chattype, save-settings-btn, tab-notif-log). Notification Log tab shows Target + Event columns and contains rows with target=Personal / Group and event=signal / test / order_failure exactly as expected.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "IBKR live-mode timeout in execute_via_ibkr()", "issue": "asyncio.wait_for(...) TimeoutError has str(e)=='' → alert.execution.error is populated as empty string. TestNotificationIndependence.test_auto_execute_live_failure_logs_signal_and_order_failed asserts truthy .error, which fails in SERIAL mode (str(TimeoutError())==''). It happened to pass in parallel mode iteration_3 because timing produced a ConnectionRefused/OSError with a non-empty message. Fix: replace `error: str(e)` with `error: str(e) or type(e).__name__` in server.py execute_via_ibkr() except-block."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_tradehub_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "In server.py execute_via_ibkr() replace `\"error\": str(e)` with `\"error\": str(e) or type(e).__name__` so asyncio.TimeoutError propagates a non-empty error string. This makes the LIVE-failure test deterministic in both serial and parallel modes.",
+    "OPTIONAL: The shipped backend/pytest.ini uses -n 2 --dist loadscope which shards test CLASSES across two workers that share one MongoDB. Any test that mutates /api/settings (e.g. TestBrokerConnect, TestEventFiltering, TestNotificationsTestEndpoint) can now race against TestWebhookFlow.test_webhook_auto_approve_timer / TestNotificationIndependence.test_auto_execute_live_failure. Two acceptable fixes: (a) drop `--dist loadscope` in favour of loadfile so a single module always shares a worker (still parallelizable across files), or (b) prefer serial `pytest -n 0` when running the whole suite. Serial is the documented supported mode inside pytest.ini itself."
+  ],
+  "critical_code_review_comments": [
+    "receive_webhook() correctly gates the auto_execute branch on `auto_on = settings.auto_trade_enabled`. When OFF the alert is inserted with status='pending', held_reason='auto_trade_disabled' is stamped, and a '🔔 APPROVAL NEEDED:' event=signal notification is dispatched — verified.",
+    "auto_approve_timer is only scheduled when auto_on is True — this correctly disables background auto-approve while the master switch is off (defensive design).",
+    "send_telegram() iterates personal + group targets, each with its own bot_token/chat_id, and falls back to the flat legacy shape — good backward compat. _log_notif() now writes `target` and `event` columns on every row — verified end-to-end via the UI log tab.",
+    "dispatch_notifications() correctly honours cfg.get('events') per-platform (default = all three) — telegram+discord+whatsapp can independently opt out of order_success/order_failure. Verified via TestEventFiltering.",
+    "/api/notifications/test correctly returns ok:false + detail.error='not_configured' and STILL inserts a log row with event='test' for missing-cred platforms — matches PRD spec.",
+    "server.py is now ~1000 lines including seed data — unchanged concern from iteration_3, splitting into routers/services would help. Not blocking.",
+    "execute_via_ibkr except-block uses `str(e)` which becomes '' for asyncio.TimeoutError. See action_items."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_tradehub_api.py (added session autouse enabling auto_trade; class autouse fixtures on TestWebhookFlow + TestNotificationIndependence; appended 10 new tests across TestAutoTradeGating, TestBrokerConnect, TestEventFiltering, TestTelegramPersonalGroup, TestNotificationsTestEndpoint, TestSettingsPersistence)"
+  ],
+  "success_rate": {
+    "backend_serial": "42/43 (97.7%) — sole failure is pre-existing str(TimeoutError())='' fragility",
+    "backend_parallel": "38/43 (88.4%) — 5 failures ALL from cross-worker /api/settings races; not real regressions",
+    "frontend": "100% — all data-testids present, auto-trade toggle + broker connect + disconnect + all notification targets/events/test buttons + save + log tab all working"
+  },
+  "test_credentials": "trader@tradehub.io / trade1234 (loaded from /app/memory/test_credentials.md via ADMIN_EMAIL/ADMIN_PASSWORD env)",
+  "seed_data_creation": "Each new test creates TEST_NF_* strategies scoped to unique symbols (HELDX, RUNX, EVFLT1, EVFLT2) and deletes them in finally blocks. Auto-trade and broker are always reset to (False, disconnected) at end of session. Global settings are overwritten by TestSettingsPersistence but that is the last test in the module.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "43 backend tests now live in /app/backend/tests/test_tradehub_api.py. Prefer `pytest -n 0` for a clean run (42/43). The default parallel mode races on shared /api/settings state between test_new_features-derived classes and the pre-existing timer tests — this is a test-infra concern, not a product bug. If the main agent tightens `str(e) or type(e).__name__` in execute_via_ibkr(), the LIVE-failure test becomes 43/43 in serial. Frontend fully verified via Playwright — all new data-testids exist and integrations round-trip. Always ensure Bot mode reset to paper + auto_trade OFF between runs."
+}
