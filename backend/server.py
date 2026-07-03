@@ -293,7 +293,7 @@ async def execute_via_ibkr(alert: dict, ibkr_cfg: dict) -> dict:
             # (no silent paper fill), so the trade can fail while the signal
             # notification has already been delivered independently.
             logger.warning(f"IBKR live order failed: {e}")
-            return {"mode": "failed", "filled": False, "error": str(e)}
+            return {"mode": "failed", "filled": False, "error": str(e) or type(e).__name__}
     base = alert.get("price") or round(random.uniform(50, 400), 2)
     return {"mode": "paper", "filled": True, "fill_price": round(base, 2)}
 
@@ -305,7 +305,7 @@ async def execute_alert(alert_id: str):
     try:
         result = await execute_via_ibkr(alert, settings.get("ibkr", {}))
     except Exception as e:
-        result = {"mode": "failed", "filled": False, "error": str(e)}
+        result = {"mode": "failed", "filled": False, "error": str(e) or type(e).__name__}
 
     # Order failed to fill: mark the alert failed and stop. The signal
     # notification was already sent at receipt, independent of this outcome.
