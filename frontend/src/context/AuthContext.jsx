@@ -4,7 +4,7 @@ import api from "@/lib/api";
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null); // null = checking
+  const [user, setUser] = useState(null);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
@@ -27,6 +27,13 @@ export function AuthProvider({ children }) {
     return data.user;
   };
 
+  const register = async (name, email, password) => {
+    const { data } = await api.post("/auth/register", { name, email, password });
+    localStorage.setItem("th_token", data.token);
+    setUser(data.user);
+    return data.user;
+  };
+
   const logout = () => {
     localStorage.removeItem("th_token");
     setUser(false);
@@ -34,7 +41,7 @@ export function AuthProvider({ children }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, ready, login, logout }}>
+    <AuthContext.Provider value={{ user, ready, login, register, logout }}>
       {children}
     </AuthContext.Provider>
   );

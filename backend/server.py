@@ -5,7 +5,7 @@ import os
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, UploadFile, File, Form, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, UploadFile, File, Form
 from fastapi.responses import PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -15,9 +15,8 @@ import logging
 import uuid
 import random
 import asyncio
-import secrets
 import string
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import httpx
@@ -84,6 +83,14 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+def public_user(u: dict) -> dict:
+    return {"id": u["id"], "email": u["email"], "name": u.get("name"), "is_admin": bool(u.get("is_admin"))}
+
 # ----------------------------------------------------------------------------
 # Models
 # ----------------------------------------------------------------------------
@@ -91,8 +98,13 @@ class LoginIn(BaseModel):
     email: EmailStr
     password: str
 
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str
+    name: str = "Trader"
+
 class OrderDefaults(BaseModel):
-    order_type: str = "market"        # market | limit | stop
+    order_type: str = "market"
     quantity: float = 1
     stop_loss_pct: Optional[float] = None
     take_profit_pct: Optional[float] = None
@@ -100,17 +112,17 @@ class OrderDefaults(BaseModel):
 class StrategyIn(BaseModel):
     name: str
     description: str = ""
-    asset_type: str = "stock"          # stock | option
-    approval_mode: str = "auto_execute"  # auto_execute | require_approval | auto_approve_timer
+    asset_type: str = "stock"
+    approval_mode: str = "auto_execute"
     auto_approve_seconds: int = 30
     message_template: str = "{action} {symbol} @ {price} (qty {quantity})"
-    notify_platforms: List[str] = []   # telegram | discord | whatsapp
+    notify_platforms: List[str] = []
     active: bool = True
     order_defaults: OrderDefaults = OrderDefaults()
 
 class TradeIn(BaseModel):
     symbol: str
-    side: str = "long"                 # long | short
+    side: str = "long"
     asset_type: str = "stock"
     entry_price: float
     exit_price: Optional[float] = None
@@ -118,7 +130,7 @@ class TradeIn(BaseModel):
     fees: float = 0
     entry_time: Optional[str] = None
     exit_time: Optional[str] = None
-    status: str = "closed"             # open | closed
+    status: str = "closed"
     strategy_id: Optional[str] = None
     tags: List[str] = []
     notes: str = ""
@@ -127,14 +139,14 @@ class TradeIn(BaseModel):
     mae: Optional[float] = None
     option_expiry: Optional[str] = None
     option_strike: Optional[float] = None
-    option_right: Optional[str] = None  # call | put
+    option_right: Optional[str] = None
     account: str = "paper"
     source: str = "manual"
 
 class TagIn(BaseModel):
     name: str
     color: str = "#007AFF"
-    type: str = "setup"               # setup | strategy | market
+    type: str = "setup"
 
 class SettingsIn(BaseModel):
     telegram: Dict[str, Any] = {}
@@ -166,8 +178,8 @@ def compute_pnl(t: dict) -> dict:
 # ----------------------------------------------------------------------------
 DEFAULT_EVENTS = ["signal", "order_success", "order_failure"]
 
-async def get_settings() -> dict:
-    s = await db.settings.find_one({"id": "global"}, {"_id": 0})
+async def get_settings(owner_id: str) -> dict:
+    s = await db.settings.find_one({"id": owner_id}, {"_id": 0})
     return s or {"telegram": {}, "discord": {}, "whatsapp": {}, "ibkr": {}, "auto_trade_enabled": False}
 
 async def _tg_send(token: str, chat: str, text: str, alert_id: str, with_actions: bool) -> dict:
@@ -183,12 +195,9 @@ async def _tg_send(token: str, chat: str, text: str, alert_id: str, with_actions
             ok = r.status_code == 200
             return {"ok": ok, "status": r.status_code, "detail": (None if ok else r.text[:300])}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e) or type(e).__name__}
 
 async def send_telegram(text: str, alert_id: str, tg: dict, with_actions: bool = True) -> list:
-    """Send to every configured Telegram target (personal and/or group). Each
-    target has its own bot token, so a dedicated bot can be used per chat type.
-    Falls back to a flat bot_token/chat_id for backward compatibility."""
     results = []
     for kind in ("personal", "group"):
         t = tg.get(kind) or {}
@@ -211,7 +220,7 @@ async def send_discord(text: str, dc: dict) -> dict:
             r = await c.post(url, json={"embeds": [{"title": "TradeHub Alert", "description": text, "color": 31487}]})
             return {"ok": r.status_code in (200, 204), "status": r.status_code}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e) or type(e).__name__}
 
 async def send_whatsapp(text: str, wa: dict) -> dict:
     sid, tok = wa.get("account_sid"), wa.get("auth_token")
@@ -224,11 +233,18 @@ async def send_whatsapp(text: str, wa: dict) -> dict:
                              data={"From": frm, "To": to, "Body": text}, auth=(sid, tok))
             return {"ok": r.status_code in (200, 201), "status": r.status_code}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e) or type(e).__name__}
+
+def render_template(tpl: str, alert: dict) -> str:
+    out = tpl
+    for k in ["symbol", "action", "price", "quantity", "order_type"]:
+        out = out.replace("{" + k + "}", str(alert.get(k, "")))
+    return out or f"{alert.get('action')} {alert.get('symbol')}"
 
 async def _log_notif(alert, strategy, platform, msg, event, res, target=None):
     await db.notifications.insert_one({
-        "id": new_id(), "alert_id": alert.get("id"), "strategy_id": strategy.get("id"),
+        "id": new_id(), "owner_id": alert.get("owner_id") or strategy.get("owner_id"),
+        "alert_id": alert.get("id"), "strategy_id": strategy.get("id"),
         "platform": platform, "target": target, "event": event, "message": msg,
         "status": "delivered" if res.get("ok") else "failed",
         "detail": res, "response": None, "sent_at": now_iso(), "responded_at": None,
@@ -237,9 +253,9 @@ async def _log_notif(alert, strategy, platform, msg, event, res, target=None):
 async def dispatch_notifications(strategy: dict, alert: dict, event: str = "signal",
                                  with_actions: bool = True, prefix: str = ""):
     """Send a notification to all configured platforms. Runs independently of
-    order execution. Each platform only receives events it opted into
-    (signal / order_success / order_failure)."""
-    settings = await get_settings()
+    order execution, using the strategy owner's saved credentials."""
+    owner_id = strategy.get("owner_id") or alert.get("owner_id")
+    settings = await get_settings(owner_id)
     msg = (prefix + render_template(strategy.get("message_template", ""), alert)).strip()
     for plat in strategy.get("notify_platforms", []):
         cfg = settings.get(plat) or {}
@@ -255,18 +271,10 @@ async def dispatch_notifications(strategy: dict, alert: dict, event: str = "sign
             r = await send_whatsapp(msg, cfg)
             await _log_notif(alert, strategy, "whatsapp", msg, event, r)
 
-def render_template(tpl: str, alert: dict) -> str:
-    out = tpl
-    for k in ["symbol", "action", "price", "quantity", "order_type"]:
-        out = out.replace("{" + k + "}", str(alert.get(k, "")))
-    return out or f"{alert.get('action')} {alert.get('symbol')}"
-
 # ----------------------------------------------------------------------------
 # IBKR execution (real if self-hosted, simulated fallback)
 # ----------------------------------------------------------------------------
 async def execute_via_ibkr(alert: dict, ibkr_cfg: dict) -> dict:
-    """Attempt real IBKR execution; falls back to simulation. Real path only
-    works when TWS/IB Gateway is reachable (self-hosted)."""
     host = ibkr_cfg.get("host", "127.0.0.1")
     port = int(ibkr_cfg.get("port", 7497))
     if ibkr_cfg.get("enabled"):
@@ -283,15 +291,12 @@ async def execute_via_ibkr(alert: dict, ibkr_cfg: dict) -> dict:
             action = "BUY" if alert.get("action") in ("buy", "long") else "SELL"
             qty = alert.get("quantity", 1)
             order = MarketOrder(action, qty) if alert.get("order_type") == "market" else LimitOrder(action, qty, alert.get("price"))
-            trade = ib.placeOrder(contract, order)
+            ib.placeOrder(contract, order)
             await asyncio.sleep(1)
             fill_price = alert.get("price")
             ib.disconnect()
             return {"mode": "live", "filled": True, "fill_price": fill_price}
         except Exception as e:
-            # Live mode: a genuine gateway/order failure is reported as failed
-            # (no silent paper fill), so the trade can fail while the signal
-            # notification has already been delivered independently.
             logger.warning(f"IBKR live order failed: {e}")
             return {"mode": "failed", "filled": False, "error": str(e) or type(e).__name__}
     base = alert.get("price") or round(random.uniform(50, 400), 2)
@@ -301,18 +306,17 @@ async def execute_alert(alert_id: str):
     alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
     if not alert or alert["status"] not in ("pending", "approved"):
         return
-    settings = await get_settings()
+    owner_id = alert.get("owner_id")
+    settings = await get_settings(owner_id)
     try:
         result = await execute_via_ibkr(alert, settings.get("ibkr", {}))
     except Exception as e:
         result = {"mode": "failed", "filled": False, "error": str(e) or type(e).__name__}
 
-    # Order failed to fill: mark the alert failed and stop. The signal
-    # notification was already sent at receipt, independent of this outcome.
+    strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
     if not result.get("filled"):
         await db.alerts.update_one({"id": alert_id}, {"$set": {
             "status": "failed", "failed_at": now_iso(), "execution": result}})
-        strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
         if strategy:
             await dispatch_notifications(strategy, alert, event="order_failure",
                                          with_actions=False, prefix="⚠️ ORDER FAILED: ")
@@ -320,7 +324,7 @@ async def execute_alert(alert_id: str):
 
     side = "long" if alert.get("action") in ("buy", "long") else "short"
     trade = {
-        "id": new_id(), "symbol": alert["symbol"], "side": side,
+        "id": new_id(), "owner_id": owner_id, "symbol": alert["symbol"], "side": side,
         "asset_type": alert.get("asset_type", "stock"),
         "entry_price": result["fill_price"], "exit_price": None,
         "quantity": alert.get("quantity", 1), "fees": 0,
@@ -337,7 +341,6 @@ async def execute_alert(alert_id: str):
     await db.alerts.update_one({"id": alert_id}, {"$set": {
         "status": "executed", "executed_at": now_iso(),
         "execution": result, "trade_id": trade["id"]}})
-    strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
     if strategy:
         await dispatch_notifications(strategy, alert, event="order_success", with_actions=False,
                                      prefix=f"✅ ORDER FILLED @ {result['fill_price']}: ")
@@ -352,26 +355,82 @@ async def auto_approve_timer(alert_id: str, seconds: int):
 # ----------------------------------------------------------------------------
 # Auth routes
 # ----------------------------------------------------------------------------
+async def seed_user_tags(owner_id: str):
+    for t in SETUP_TAGS:
+        await db.tags.insert_one({"id": new_id(), "owner_id": owner_id, **t})
+
 @api.post("/auth/login")
 async def login(body: LoginIn):
     user = await db.users.find_one({"email": body.email.lower()})
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_token(user["id"], user["email"])
-    return {"token": token, "user": {"id": user["id"], "email": user["email"], "name": user.get("name")}}
+    return {"token": token, "user": public_user(user)}
+
+@api.post("/auth/register")
+async def register(body: RegisterIn):
+    email = body.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    uid = new_id()
+    await db.users.insert_one({
+        "id": uid, "email": email, "password_hash": hash_password(body.password),
+        "name": body.name or "Trader", "is_admin": False, "created_at": now_iso(),
+    })
+    await seed_user_tags(uid)
+    token = create_token(uid, email)
+    return {"token": token, "user": {"id": uid, "email": email, "name": body.name, "is_admin": False}}
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     return user
 
 # ----------------------------------------------------------------------------
+# User management (admin)
+# ----------------------------------------------------------------------------
+@api.get("/users")
+async def list_users(admin: dict = Depends(require_admin)):
+    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(500)
+    for u in users:
+        u["is_admin"] = bool(u.get("is_admin"))
+        u["trade_count"] = await db.trades.count_documents({"owner_id": u["id"]})
+        u["strategy_count"] = await db.strategies.count_documents({"owner_id": u["id"]})
+    return users
+
+@api.post("/users")
+async def create_user(body: RegisterIn, admin: dict = Depends(require_admin)):
+    email = body.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    uid = new_id()
+    await db.users.insert_one({
+        "id": uid, "email": email, "password_hash": hash_password(body.password),
+        "name": body.name or "Trader", "is_admin": False, "created_at": now_iso(),
+    })
+    await seed_user_tags(uid)
+    return {"id": uid, "email": email, "name": body.name, "is_admin": False}
+
+@api.delete("/users/{uid}")
+async def delete_user(uid: str, admin: dict = Depends(require_admin)):
+    if uid == admin["id"]:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+    target = await db.users.find_one({"id": uid})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    for col in (db.strategies, db.trades, db.alerts, db.notifications, db.tags, db.settings):
+        await col.delete_many({"owner_id": uid})
+    await db.users.delete_one({"id": uid})
+    return {"deleted": True}
+
+# ----------------------------------------------------------------------------
 # Strategy routes
 # ----------------------------------------------------------------------------
 @api.get("/strategies")
 async def list_strategies(user: dict = Depends(get_current_user)):
-    strategies = await db.strategies.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    owner = user["id"]
+    strategies = await db.strategies.find({"owner_id": owner}, {"_id": 0}).sort("created_at", -1).to_list(500)
     for s in strategies:
-        trades = await db.trades.find({"strategy_id": s["id"]}, {"_id": 0}).to_list(2000)
+        trades = await db.trades.find({"strategy_id": s["id"], "owner_id": owner}, {"_id": 0}).to_list(2000)
         closed = [t for t in trades if t.get("pnl") is not None]
         s["total_trades"] = len(trades)
         s["total_pnl"] = round(sum(t["pnl"] for t in closed), 2)
@@ -386,7 +445,7 @@ async def list_strategies(user: dict = Depends(get_current_user)):
 async def create_strategy(body: StrategyIn, user: dict = Depends(get_current_user)):
     doc = body.model_dump()
     doc["order_defaults"] = body.order_defaults.model_dump()
-    doc.update({"id": new_id(), "webhook_token": gen_webhook_token(), "created_at": now_iso()})
+    doc.update({"id": new_id(), "owner_id": user["id"], "webhook_token": gen_webhook_token(), "created_at": now_iso()})
     await db.strategies.insert_one({**doc})
     doc.pop("_id", None)
     doc["webhook_url"] = f"{APP_BASE_URL}/api/webhook/{doc['webhook_token']}"
@@ -394,26 +453,26 @@ async def create_strategy(body: StrategyIn, user: dict = Depends(get_current_use
 
 @api.get("/strategies/{sid}")
 async def get_strategy(sid: str, user: dict = Depends(get_current_user)):
-    s = await db.strategies.find_one({"id": sid}, {"_id": 0})
+    s = await db.strategies.find_one({"id": sid, "owner_id": user["id"]}, {"_id": 0})
     if not s:
         raise HTTPException(404, "Strategy not found")
     s["webhook_url"] = f"{APP_BASE_URL}/api/webhook/{s['webhook_token']}"
     s["alerts"] = await db.alerts.find({"strategy_id": sid}, {"_id": 0}).sort("received_at", -1).to_list(100)
-    s["trades"] = await db.trades.find({"strategy_id": sid}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    s["trades"] = await db.trades.find({"strategy_id": sid, "owner_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
     return s
 
 @api.put("/strategies/{sid}")
 async def update_strategy(sid: str, body: StrategyIn, user: dict = Depends(get_current_user)):
     doc = body.model_dump()
     doc["order_defaults"] = body.order_defaults.model_dump()
-    res = await db.strategies.update_one({"id": sid}, {"$set": doc})
+    res = await db.strategies.update_one({"id": sid, "owner_id": user["id"]}, {"$set": doc})
     if res.matched_count == 0:
         raise HTTPException(404, "Strategy not found")
     return await get_strategy(sid, user)
 
 @api.post("/strategies/{sid}/toggle")
 async def toggle_strategy(sid: str, user: dict = Depends(get_current_user)):
-    s = await db.strategies.find_one({"id": sid}, {"_id": 0})
+    s = await db.strategies.find_one({"id": sid, "owner_id": user["id"]}, {"_id": 0})
     if not s:
         raise HTTPException(404, "Strategy not found")
     await db.strategies.update_one({"id": sid}, {"$set": {"active": not s.get("active", True)}})
@@ -421,7 +480,7 @@ async def toggle_strategy(sid: str, user: dict = Depends(get_current_user)):
 
 @api.delete("/strategies/{sid}")
 async def delete_strategy(sid: str, user: dict = Depends(get_current_user)):
-    await db.strategies.delete_one({"id": sid})
+    await db.strategies.delete_one({"id": sid, "owner_id": user["id"]})
     return {"deleted": True}
 
 # ----------------------------------------------------------------------------
@@ -432,6 +491,7 @@ async def receive_webhook(token: str, request: Request):
     strategy = await db.strategies.find_one({"webhook_token": token}, {"_id": 0})
     if not strategy:
         raise HTTPException(404, "Unknown webhook")
+    owner_id = strategy.get("owner_id")
     try:
         payload = await request.json()
     except Exception:
@@ -439,7 +499,7 @@ async def receive_webhook(token: str, request: Request):
         payload = {"raw": raw}
     od = strategy.get("order_defaults", {})
     alert = {
-        "id": new_id(), "strategy_id": strategy["id"], "strategy_name": strategy["name"],
+        "id": new_id(), "owner_id": owner_id, "strategy_id": strategy["id"], "strategy_name": strategy["name"],
         "action": str(payload.get("action", "buy")).lower(),
         "symbol": str(payload.get("symbol", payload.get("ticker", "UNKNOWN"))).upper(),
         "quantity": payload.get("quantity", od.get("quantity", 1)),
@@ -456,21 +516,17 @@ async def receive_webhook(token: str, request: Request):
         await db.alerts.insert_one({**alert})
         return {"status": "ignored", "reason": "strategy paused"}
 
-    settings = await get_settings()
+    settings = await get_settings(owner_id)
     auto_on = bool(settings.get("auto_trade_enabled"))
     mode = strategy.get("approval_mode", "auto_execute")
 
-    # Auto-execute only when the master Auto-Trade switch is ON.
     if mode == "auto_execute" and auto_on:
         alert["status"] = "approved"
         await db.alerts.insert_one({**alert})
-        # Signal notification FIRST, independent of execution outcome.
         await dispatch_notifications(strategy, alert, event="signal", with_actions=False, prefix="⚡ SIGNAL: ")
         await execute_alert(alert["id"])
         return {"status": "executed", "alert_id": alert["id"]}
 
-    # Otherwise hold for manual approval: require_approval, or any auto mode
-    # while Auto-Trade is OFF (e.g. no broker connected).
     alert["status"] = "pending"
     schedule_timer = (mode == "auto_approve_timer" and auto_on)
     if schedule_timer:
@@ -488,16 +544,18 @@ async def receive_webhook(token: str, request: Request):
 
 @api.get("/alerts")
 async def list_alerts(status: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q = {"status": status} if status else {}
+    q = {"owner_id": user["id"]}
+    if status:
+        q["status"] = status
     return await db.alerts.find(q, {"_id": 0}).sort("received_at", -1).to_list(300)
 
 @api.get("/alerts/pending")
 async def pending_alerts(user: dict = Depends(get_current_user)):
-    return await db.alerts.find({"status": "pending"}, {"_id": 0}).sort("received_at", -1).to_list(100)
+    return await db.alerts.find({"status": "pending", "owner_id": user["id"]}, {"_id": 0}).sort("received_at", -1).to_list(100)
 
 @api.post("/alerts/{aid}/approve")
 async def approve_alert(aid: str, user: dict = Depends(get_current_user)):
-    alert = await db.alerts.find_one({"id": aid}, {"_id": 0})
+    alert = await db.alerts.find_one({"id": aid, "owner_id": user["id"]}, {"_id": 0})
     if not alert:
         raise HTTPException(404, "Alert not found")
     if alert["status"] != "pending":
@@ -508,87 +566,87 @@ async def approve_alert(aid: str, user: dict = Depends(get_current_user)):
 
 @api.post("/alerts/{aid}/reject")
 async def reject_alert(aid: str, user: dict = Depends(get_current_user)):
-    res = await db.alerts.update_one({"id": aid, "status": "pending"}, {"$set": {"status": "rejected", "rejected_at": now_iso()}})
+    res = await db.alerts.update_one({"id": aid, "owner_id": user["id"], "status": "pending"},
+                                     {"$set": {"status": "rejected", "rejected_at": now_iso()}})
     if res.matched_count == 0:
         raise HTTPException(400, "Alert not pending")
     return {"status": "rejected"}
 
 # ----------------------------------------------------------------------------
-# Bot status
+# Bot
 # ----------------------------------------------------------------------------
 @api.get("/bot/status")
 async def bot_status(user: dict = Depends(get_current_user)):
-    settings = await get_settings()
+    owner = user["id"]
+    settings = await get_settings(owner)
     ibkr = settings.get("ibkr", {})
     connected = bool(ibkr.get("enabled"))
-    auto_on = bool(settings.get("auto_trade_enabled"))
-    recent = await db.alerts.find({}, {"_id": 0}).sort("received_at", -1).to_list(25)
-    total = await db.alerts.count_documents({})
-    executed = await db.alerts.count_documents({"status": "executed"})
-    pending = await db.alerts.count_documents({"status": "pending"})
-    failed = await db.alerts.count_documents({"status": "failed"})
+    recent = await db.alerts.find({"owner_id": owner}, {"_id": 0}).sort("received_at", -1).to_list(25)
+    total = await db.alerts.count_documents({"owner_id": owner})
+    executed = await db.alerts.count_documents({"owner_id": owner, "status": "executed"})
+    pending = await db.alerts.count_documents({"owner_id": owner, "status": "pending"})
+    failed = await db.alerts.count_documents({"owner_id": owner, "status": "failed"})
     return {
-        "auto_trade_enabled": auto_on,
-        "broker_connected": connected,
-        "ibkr_connected": connected,
+        "auto_trade_enabled": bool(settings.get("auto_trade_enabled")),
+        "broker_connected": connected, "ibkr_connected": connected,
         "mode": "live" if connected else "paper",
         "host": ibkr.get("host", "127.0.0.1"), "port": ibkr.get("port", 7497),
         "recent_alerts": recent,
         "stats": {"total": total, "executed": executed, "pending": pending, "failed": failed},
     }
 
+async def _update_settings(owner: str, patch: dict):
+    await db.settings.update_one({"id": owner}, {"$set": {**patch, "id": owner, "owner_id": owner}}, upsert=True)
+
 @api.post("/bot/auto-trade")
 async def set_auto_trade(body: dict, user: dict = Depends(get_current_user)):
     enabled = bool(body.get("enabled"))
-    await db.settings.update_one({"id": "global"}, {"$set": {"auto_trade_enabled": enabled}}, upsert=True)
+    await _update_settings(user["id"], {"auto_trade_enabled": enabled})
     return {"auto_trade_enabled": enabled}
 
 @api.post("/bot/broker")
 async def set_broker(body: dict, user: dict = Depends(get_current_user)):
-    """Connect/disconnect the broker. In this cloud env a live connection is
-    unreachable, so fills use the paper simulation until you self-host TWS/Gateway."""
     connected = bool(body.get("connected"))
-    s = await get_settings()
+    s = await get_settings(user["id"])
     ibkr = s.get("ibkr", {})
     ibkr["enabled"] = connected
     if body.get("host"):
         ibkr["host"] = body["host"]
     if body.get("port"):
         ibkr["port"] = body["port"]
-    await db.settings.update_one({"id": "global"}, {"$set": {"ibkr": ibkr}}, upsert=True)
+    await _update_settings(user["id"], {"ibkr": ibkr})
     return {"broker_connected": connected, "host": ibkr.get("host"), "port": ibkr.get("port")}
 
 @api.post("/bot/mode")
 async def set_bot_mode(body: dict, user: dict = Depends(get_current_user)):
     enabled = bool(body.get("live"))
-    s = await get_settings()
+    s = await get_settings(user["id"])
     ibkr = s.get("ibkr", {})
     ibkr["enabled"] = enabled
-    await db.settings.update_one({"id": "global"}, {"$set": {"ibkr": ibkr}}, upsert=True)
+    await _update_settings(user["id"], {"ibkr": ibkr})
     return {"mode": "live" if enabled else "paper"}
 
 @api.post("/notifications/test")
 async def test_notification(body: dict, user: dict = Depends(get_current_user)):
-    """Send a test message to a platform using the saved credentials, so you can
-    verify the integration end-to-end from the Settings page."""
     platform = body.get("platform")
-    settings = await get_settings()
+    settings = await get_settings(user["id"])
     cfg = settings.get(platform) or {}
     msg = f"🧪 TradeHub test — your {platform} notifications are working!"
+    ref = {"id": "test", "owner_id": user["id"]}
     if platform == "telegram":
         results = await send_telegram(msg, "test", cfg, with_actions=False)
         ok = any(r.get("ok") for r in results)
         detail = results
         for r in results:
-            await _log_notif({"id": "test"}, {"id": "test"}, "telegram", msg, "test", r, r.get("target"))
+            await _log_notif(ref, ref, "telegram", msg, "test", r, r.get("target"))
     elif platform == "discord":
         detail = await send_discord(msg, cfg)
         ok = detail.get("ok")
-        await _log_notif({"id": "test"}, {"id": "test"}, "discord", msg, "test", detail, cfg.get("chat_type"))
+        await _log_notif(ref, ref, "discord", msg, "test", detail, cfg.get("chat_type"))
     elif platform == "whatsapp":
         detail = await send_whatsapp(msg, cfg)
         ok = detail.get("ok")
-        await _log_notif({"id": "test"}, {"id": "test"}, "whatsapp", msg, "test", detail)
+        await _log_notif(ref, ref, "whatsapp", msg, "test", detail)
     else:
         raise HTTPException(400, "Unknown platform")
     return {"ok": bool(ok), "detail": detail}
@@ -602,7 +660,7 @@ async def list_trades(
     strategy_id: Optional[str] = None, tag: Optional[str] = None,
     start: Optional[str] = None, end: Optional[str] = None,
     user: dict = Depends(get_current_user)):
-    q: Dict[str, Any] = {}
+    q: Dict[str, Any] = {"owner_id": user["id"]}
     if symbol: q["symbol"] = symbol.upper()
     if side: q["side"] = side
     if strategy_id: q["strategy_id"] = strategy_id
@@ -620,6 +678,7 @@ async def list_trades(
 async def create_trade(body: TradeIn, user: dict = Depends(get_current_user)):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["owner_id"] = user["id"]
     doc["entry_time"] = doc.get("entry_time") or now_iso()
     doc["source"] = "manual"
     doc["created_at"] = now_iso()
@@ -630,7 +689,7 @@ async def create_trade(body: TradeIn, user: dict = Depends(get_current_user)):
 
 @api.get("/trades/{tid}")
 async def get_trade(tid: str, user: dict = Depends(get_current_user)):
-    t = await db.trades.find_one({"id": tid}, {"_id": 0})
+    t = await db.trades.find_one({"id": tid, "owner_id": user["id"]}, {"_id": 0})
     if not t:
         raise HTTPException(404, "Trade not found")
     return t
@@ -639,18 +698,21 @@ async def get_trade(tid: str, user: dict = Depends(get_current_user)):
 async def update_trade(tid: str, body: TradeIn, user: dict = Depends(get_current_user)):
     doc = body.model_dump()
     doc = compute_pnl(doc)
-    res = await db.trades.update_one({"id": tid}, {"$set": doc})
+    res = await db.trades.update_one({"id": tid, "owner_id": user["id"]}, {"$set": doc})
     if res.matched_count == 0:
         raise HTTPException(404, "Trade not found")
     return await get_trade(tid, user)
 
 @api.delete("/trades/{tid}")
 async def delete_trade(tid: str, user: dict = Depends(get_current_user)):
-    await db.trades.delete_one({"id": tid})
+    await db.trades.delete_one({"id": tid, "owner_id": user["id"]})
     return {"deleted": True}
 
 @api.post("/trades/{tid}/attachment")
 async def upload_attachment(tid: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    t = await db.trades.find_one({"id": tid, "owner_id": user["id"]}, {"_id": 0})
+    if not t:
+        raise HTTPException(404, "Trade not found")
     ext = Path(file.filename).suffix
     fname = f"{tid}_{new_id()}{ext}"
     content = await file.read()
@@ -672,19 +734,20 @@ async def get_upload(fname: str):
 # ----------------------------------------------------------------------------
 @api.get("/tags")
 async def list_tags(user: dict = Depends(get_current_user)):
-    return await db.tags.find({}, {"_id": 0}).to_list(200)
+    return await db.tags.find({"owner_id": user["id"]}, {"_id": 0}).to_list(200)
 
 @api.post("/tags")
 async def create_tag(body: TagIn, user: dict = Depends(get_current_user)):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["owner_id"] = user["id"]
     await db.tags.insert_one({**doc})
     doc.pop("_id", None)
     return doc
 
 @api.delete("/tags/{tid}")
 async def delete_tag(tid: str, user: dict = Depends(get_current_user)):
-    await db.tags.delete_one({"id": tid})
+    await db.tags.delete_one({"id": tid, "owner_id": user["id"]})
     return {"deleted": True}
 
 # ----------------------------------------------------------------------------
@@ -692,34 +755,35 @@ async def delete_tag(tid: str, user: dict = Depends(get_current_user)):
 # ----------------------------------------------------------------------------
 @api.get("/notifications")
 async def list_notifications(user: dict = Depends(get_current_user)):
-    return await db.notifications.find({}, {"_id": 0}).sort("sent_at", -1).to_list(300)
+    return await db.notifications.find({"owner_id": user["id"]}, {"_id": 0}).sort("sent_at", -1).to_list(300)
 
 @api.get("/settings")
 async def get_settings_route(user: dict = Depends(get_current_user)):
-    s = await get_settings()
+    s = await get_settings(user["id"])
     s.pop("id", None)
+    s.pop("owner_id", None)
     return s
 
 @api.put("/settings")
 async def update_settings(body: SettingsIn, user: dict = Depends(get_current_user)):
     doc = body.model_dump()
-    doc["id"] = "global"
-    await db.settings.update_one({"id": "global"}, {"$set": doc}, upsert=True)
+    doc["id"] = user["id"]
+    doc["owner_id"] = user["id"]
+    await db.settings.update_one({"id": user["id"]}, {"$set": doc}, upsert=True)
     return {"saved": True}
 
 # ----------------------------------------------------------------------------
 # Analytics
 # ----------------------------------------------------------------------------
-async def closed_trades() -> List[dict]:
-    trades = await db.trades.find({"status": "closed", "pnl": {"$ne": None}}, {"_id": 0}).to_list(5000)
-    def tdate(t):
-        return t.get("exit_time") or t.get("entry_time") or ""
-    trades.sort(key=tdate)
+async def closed_trades(owner_id: str) -> List[dict]:
+    trades = await db.trades.find({"owner_id": owner_id, "status": "closed", "pnl": {"$ne": None}}, {"_id": 0}).to_list(5000)
+    trades.sort(key=lambda t: t.get("exit_time") or t.get("entry_time") or "")
     return trades
 
 @api.get("/analytics/overview")
 async def analytics_overview(user: dict = Depends(get_current_user)):
-    trades = await closed_trades()
+    owner = user["id"]
+    trades = await closed_trades(owner)
     pnls = [t["pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
@@ -730,7 +794,6 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
     profit_factor = round(sum(wins) / abs(sum(losses)), 2) if losses else (round(sum(wins), 2) if wins else 0)
     rs = [t["r_multiple"] for t in trades if t.get("r_multiple") is not None]
     expectancy = round(sum(rs) / len(rs), 2) if rs else 0
-    # streaks
     cur = best = worst = 0
     for p in pnls:
         if p > 0:
@@ -738,7 +801,7 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
         elif p < 0:
             cur = cur - 1 if cur < 0 else -1
         best = max(best, cur); worst = min(worst, cur)
-    open_count = await db.trades.count_documents({"status": "open"})
+    open_count = await db.trades.count_documents({"owner_id": owner, "status": "open"})
     return {
         "total_pnl": total, "total_trades": len(pnls), "win_rate": win_rate,
         "avg_win": avg_win, "avg_loss": avg_loss, "profit_factor": profit_factor,
@@ -751,11 +814,9 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
 
 @api.get("/analytics/equity-curve")
 async def equity_curve(user: dict = Depends(get_current_user)):
-    trades = await closed_trades()
+    trades = await closed_trades(user["id"])
     out = []
-    cum = 0
-    peak = 0
-    max_dd = 0
+    cum = peak = max_dd = 0
     for i, t in enumerate(trades):
         cum = round(cum + t["pnl"], 2)
         peak = max(peak, cum)
@@ -767,7 +828,7 @@ async def equity_curve(user: dict = Depends(get_current_user)):
 
 @api.get("/analytics/calendar")
 async def calendar(year: int, month: int, user: dict = Depends(get_current_user)):
-    trades = await closed_trades()
+    trades = await closed_trades(user["id"])
     days: Dict[str, dict] = {}
     for t in trades:
         d = (t.get("exit_time") or t.get("entry_time") or "")[:10]
@@ -781,11 +842,11 @@ async def calendar(year: int, month: int, user: dict = Depends(get_current_user)
 
 @api.get("/analytics/by/{dim}")
 async def analytics_by(dim: str, user: dict = Depends(get_current_user)):
-    trades = await closed_trades()
-    strat_map = {s["id"]: s["name"] for s in await db.strategies.find({}, {"_id": 0}).to_list(500)}
+    owner = user["id"]
+    trades = await closed_trades(owner)
+    strat_map = {s["id"]: s["name"] for s in await db.strategies.find({"owner_id": owner}, {"_id": 0}).to_list(500)}
     groups: Dict[str, List[dict]] = {}
     for t in trades:
-        keys = []
         if dim == "symbol": keys = [t.get("symbol", "—")]
         elif dim == "side": keys = [t.get("side", "—")]
         elif dim == "strategy": keys = [strat_map.get(t.get("strategy_id"), "Unassigned")]
@@ -804,30 +865,30 @@ async def analytics_by(dim: str, user: dict = Depends(get_current_user)):
 
 @api.get("/analytics/mfe-mae")
 async def mfe_mae(user: dict = Depends(get_current_user)):
-    trades = await closed_trades()
+    trades = await closed_trades(user["id"])
     return [{"symbol": t["symbol"], "mfe": t.get("mfe"), "mae": t.get("mae"), "pnl": t["pnl"],
              "r_multiple": t.get("r_multiple")} for t in trades if t.get("mfe") is not None or t.get("mae") is not None]
 
 @api.get("/analytics/time-of-day")
 async def time_of_day(user: dict = Depends(get_current_user)):
-    trades = await closed_trades()
+    trades = await closed_trades(user["id"])
     buckets: Dict[int, dict] = {h: {"pnl": 0, "trades": 0} for h in range(24)}
     for t in trades:
-        ts = t.get("entry_time") or ""
         try:
-            h = datetime.fromisoformat(ts).hour
+            hr = datetime.fromisoformat(t.get("entry_time") or "").hour
         except Exception:
             continue
-        buckets[h]["pnl"] = round(buckets[h]["pnl"] + t["pnl"], 2)
-        buckets[h]["trades"] += 1
-    return [{"hour": h, **buckets[h]} for h in range(24) if buckets[h]["trades"] > 0]
+        buckets[hr]["pnl"] = round(buckets[hr]["pnl"] + t["pnl"], 2)
+        buckets[hr]["trades"] += 1
+    return [{"hour": hr, **buckets[hr]} for hr in range(24) if buckets[hr]["trades"] > 0]
 
 @api.get("/analytics/strategy-comparison")
 async def strategy_comparison(user: dict = Depends(get_current_user)):
-    strategies = await db.strategies.find({}, {"_id": 0}).to_list(500)
+    owner = user["id"]
+    strategies = await db.strategies.find({"owner_id": owner}, {"_id": 0}).to_list(500)
     out = []
     for s in strategies:
-        trades = await db.trades.find({"strategy_id": s["id"], "status": "closed", "pnl": {"$ne": None}}, {"_id": 0}).to_list(2000)
+        trades = await db.trades.find({"strategy_id": s["id"], "owner_id": owner, "status": "closed", "pnl": {"$ne": None}}, {"_id": 0}).to_list(2000)
         pnls = [t["pnl"] for t in trades]
         wins = [p for p in pnls if p > 0]
         rs = [t["r_multiple"] for t in trades if t.get("r_multiple") is not None]
@@ -845,8 +906,7 @@ async def telegram_callback(request: Request):
     cb = update.get("callback_query")
     if not cb:
         return {"ok": True}
-    data = cb.get("data", "")
-    parts = data.split(":", 1)
+    parts = (cb.get("data", "") or "").split(":", 1)
     if len(parts) != 2:
         return {"ok": True}
     action, aid = parts
@@ -889,29 +949,33 @@ SETUP_TAGS = [
 ]
 
 async def seed():
-    # Idempotent admin seeding: create the login user if missing, and always
-    # sync its password to ADMIN_PASSWORD from env so a changed/rotated secret
-    # (e.g. after a redeploy) takes effect on startup instead of failing login.
     admin_email = os.environ["ADMIN_EMAIL"].lower()
     admin_password = os.environ["ADMIN_PASSWORD"]
     existing = await db.users.find_one({"email": admin_email})
     if existing is None:
+        admin_id = new_id()
         await db.users.insert_one({
-            "id": new_id(), "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "name": "Trader", "created_at": now_iso(),
+            "id": admin_id, "email": admin_email, "password_hash": hash_password(admin_password),
+            "name": "Trader", "is_admin": True, "created_at": now_iso(),
         })
         logger.info("Seeded admin user")
-    elif not verify_password(admin_password, existing["password_hash"]):
-        await db.users.update_one({"email": admin_email},
-                                  {"$set": {"password_hash": hash_password(admin_password)}})
-        logger.info("Admin password re-synced from env")
+    else:
+        admin_id = existing["id"]
+        if not verify_password(admin_password, existing["password_hash"]):
+            await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
+            logger.info("Admin password re-synced from env")
+        if not existing.get("is_admin"):
+            await db.users.update_one({"email": admin_email}, {"$set": {"is_admin": True}})
 
-    if await db.tags.count_documents({}) == 0:
-        for t in SETUP_TAGS:
-            await db.tags.insert_one({"id": new_id(), **t})
+    # Backfill legacy (pre multi-user) data to the admin owner
+    for col in (db.strategies, db.trades, db.alerts, db.notifications, db.tags):
+        await col.update_many({"owner_id": {"$exists": False}}, {"$set": {"owner_id": admin_id}})
+    await db.settings.update_one({"id": "global"}, {"$set": {"id": admin_id, "owner_id": admin_id}})
 
-    if await db.strategies.count_documents({}) == 0:
+    if await db.tags.count_documents({"owner_id": admin_id}) == 0:
+        await seed_user_tags(admin_id)
+
+    if await db.strategies.count_documents({"owner_id": admin_id}) == 0:
         strats = [
             {"name": "Momentum Scalp", "description": "Fast intraday momentum scalps on liquid names.",
              "asset_type": "stock", "approval_mode": "auto_execute", "notify_platforms": ["telegram"]},
@@ -924,14 +988,14 @@ async def seed():
         for s in strats:
             doc = StrategyIn(**s).model_dump()
             doc["order_defaults"] = OrderDefaults().model_dump()
-            doc.update({"id": new_id(), "webhook_token": gen_webhook_token(), "created_at": now_iso()})
+            doc.update({"id": new_id(), "owner_id": admin_id, "webhook_token": gen_webhook_token(), "created_at": now_iso()})
             await db.strategies.insert_one({**doc})
         logger.info("Seeded strategies")
 
-    if await db.trades.count_documents({}) == 0:
+    if await db.trades.count_documents({"owner_id": admin_id}) == 0:
         rnd = random.Random(42)
-        strategies = await db.strategies.find({}, {"_id": 0}).to_list(10)
-        tags = await db.tags.find({}, {"_id": 0}).to_list(20)
+        strategies = await db.strategies.find({"owner_id": admin_id}, {"_id": 0}).to_list(10)
+        tags = await db.tags.find({"owner_id": admin_id}, {"_id": 0}).to_list(20)
         setup_names = [t["name"] for t in tags]
         start = datetime.now(timezone.utc) - timedelta(days=70)
         trades = []
@@ -948,10 +1012,9 @@ async def seed():
             ex = round(entry * (1 + move_pct * direction), 2)
             qty = rnd.choice([1, 2, 5, 10]) if asset == "option" else rnd.choice([10, 25, 50, 100])
             risk = round(entry * 0.02 * qty * (100 if asset == "option" else 1), 2)
-            hold_min = rnd.randint(5, 600)
-            exit_time = day + timedelta(minutes=hold_min)
+            exit_time = day + timedelta(minutes=rnd.randint(5, 600))
             t = {
-                "id": new_id(), "symbol": sym, "side": side, "asset_type": asset,
+                "id": new_id(), "owner_id": admin_id, "symbol": sym, "side": side, "asset_type": asset,
                 "entry_price": entry, "exit_price": ex, "quantity": qty, "fees": round(rnd.uniform(0.5, 3), 2),
                 "entry_time": day.isoformat(), "exit_time": exit_time.isoformat(), "status": "closed",
                 "strategy_id": strat["id"], "tags": rnd.sample(setup_names, k=rnd.randint(1, 2)),
@@ -967,33 +1030,34 @@ async def seed():
         await db.trades.insert_many(trades)
         logger.info(f"Seeded {len(trades)} trades")
 
-    # sample alerts incl. pending
-    if await db.alerts.count_documents({}) == 0:
-        strategies = await db.strategies.find({}, {"_id": 0}).to_list(10)
+    if await db.alerts.count_documents({"owner_id": admin_id}) == 0:
+        strategies = await db.strategies.find({"owner_id": admin_id}, {"_id": 0}).to_list(10)
         approval_strat = next((s for s in strategies if s["approval_mode"] != "auto_execute"), strategies[0])
         for i in range(2):
             await db.alerts.insert_one({
-                "id": new_id(), "strategy_id": approval_strat["id"], "strategy_name": approval_strat["name"],
-                "action": "buy", "symbol": random.choice(SAMPLE_SYMBOLS), "quantity": 10,
-                "order_type": "market", "price": round(random.uniform(100, 300), 2),
-                "asset_type": approval_strat["asset_type"], "status": "pending",
-                "received_at": now_iso(), "raw_payload": {},
+                "id": new_id(), "owner_id": admin_id, "strategy_id": approval_strat["id"],
+                "strategy_name": approval_strat["name"], "action": "buy",
+                "symbol": random.choice(SAMPLE_SYMBOLS), "quantity": 10, "order_type": "market",
+                "price": round(random.uniform(100, 300), 2), "asset_type": approval_strat["asset_type"],
+                "status": "pending", "received_at": now_iso(), "raw_payload": {},
             })
 
 @app.on_event("startup")
 async def startup():
+    await db.users.create_index("email", unique=True)
     await db.strategies.create_index("webhook_token")
-    await db.trades.create_index("strategy_id")
-    await db.alerts.create_index("status")
+    await db.strategies.create_index("owner_id")
+    await db.trades.create_index("owner_id")
+    await db.alerts.create_index("owner_id")
     await seed()
-    # write test creds
-    creds = Path("/app/memory/test_credentials.md")
-    creds.write_text(
+    Path("/app/memory/test_credentials.md").write_text(
         "# Test Credentials\n\n"
-        f"Admin / Trader login (JWT, Bearer token):\n"
+        "Multi-user app (JWT Bearer). Admin account (can manage users):\n"
         f"- email: {os.environ['ADMIN_EMAIL']}\n"
         f"- password: {os.environ['ADMIN_PASSWORD']}\n\n"
-        "Auth endpoints: POST /api/auth/login, GET /api/auth/me (Authorization: Bearer <token>)\n"
+        "Any new user can self-register at POST /api/auth/register or be created by an admin (POST /api/users).\n"
+        "Auth: POST /api/auth/login, POST /api/auth/register, GET /api/auth/me (Authorization: Bearer <token>)\n"
+        "Admin-only: GET/POST /api/users, DELETE /api/users/{id}\n"
     )
 
 @app.on_event("shutdown")

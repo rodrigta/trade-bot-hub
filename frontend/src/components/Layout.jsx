@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, Layers, Bot as BotIcon, BookOpen, BarChart3, Bell,
-  Sun, Moon, LogOut, Activity,
+  Sun, Moon, LogOut, Activity, Users as UsersIcon,
 } from "lucide-react";
 import { useTheme } from "@/context/ThemeContext";
 import { useAuth } from "@/context/AuthContext";
@@ -49,6 +49,20 @@ export default function Layout() {
               {n.label}
             </NavLink>
           ))}
+          {user?.is_admin && (
+            <NavLink
+              to="/users"
+              data-testid="nav-users"
+              className={({ isActive }) =>
+                `flex items-center gap-3 px-3 py-2.5 rounded-md text-sm font-medium transition-all duration-200 ${
+                  isActive ? "bg-[#007AFF] text-white" : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                }`
+              }
+            >
+              <UsersIcon className="w-[18px] h-[18px]" />
+              Users
+            </NavLink>
+          )}
         </nav>
         <div className="p-3 border-t border-border space-y-2">
           <div className="px-3 py-1 text-xs text-muted-foreground truncate">{user?.email}</div>

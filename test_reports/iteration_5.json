@@ -1,0 +1,45 @@
+{
+  "summary": "Verified both changes end-to-end: (A) bug-fix admin login (trader@tradehub.io / trade1234) works, returns is_admin=true, /auth/me OK, invalid password → 401. (B) Full multi-tenancy: self-registration creates user + 6 default tags + token, duplicate → 400; new user workspace is completely EMPTY (analytics/overview total_trades=0, strategies=[], trades=[], alerts=[]); admin still sees the seeded 120 trades + 3 strategies. Cross-account isolation verified: neither account sees the other's strategies/trades; GET by id across accounts → 404. Admin user-management endpoints (GET/POST/DELETE /api/users) work: list includes trade_count/strategy_count/is_admin, admin can create/delete, deletion removes login + all owned data, admin deleting own id → 400. Non-admin calling /api/users endpoints → 403. Unauthenticated /api requests → 401. Webhook posting to a user's strategy creates an alert owned by that user; admin does NOT see it. Regression: full 43/43 pytest suite in /app/backend/tests/test_tradehub_api.py still passes serially (auto-trade toggled ON via session fixture, then reset). Frontend: Login page has switch-to-register/switch-to-login toggle + register-name field, registering logs in and lands on empty dashboard, non-admin has NO nav-users item, admin has nav-users, Users page lists users (trade_count/strategy_count columns), 'Add User' dialog (new-user-btn → user-name-input/user-email-input/user-password-input → save-user-btn) creates a user that shows up in the table, delete button removes non-self users (toast 'User deleted'), admin's own row shows 'You' with no delete button. All admin state reset at end (auto_trade OFF, broker disconnected, live=false) and all test users deleted.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Users page (and any page reached from login)", "issues": ["The green 'Welcome back' toast is anchored top-right and its ~48px-tall container/pointer-events area overlaps the top-right PageHeader button (new-user-btn) for the first ~3s after navigation. Playwright page.click(force=True) still records as intercepted; dispatchEvent('click') works. A real user waiting for the toast to fade (or one who clicks below the toast) is unaffected. Recommend either shortening the toast auto-dismiss to ~1.5s, adding pointer-events:none on the toast wrapper, or reducing top offset so it does not cover PageHeader action buttons."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_multitenancy.py",
+    "/app/backend/tests/test_tradehub_api.py",
+    "/app/test_reports/pytest/multitenancy_results.xml",
+    "/app/test_reports/pytest/regression_results.xml"
+  ],
+  "action_items": [
+    "OPTIONAL polish: give the sonner/toast wrapper pointer-events:none (or auto-dismiss < 2s) so it does not shadow PageHeader action buttons like new-user-btn during the first few seconds after navigation. Not a functional blocker — click still works via keyboard/normal usage — but it caused a spurious Playwright interception in automated tests until dispatchEvent was used."
+  ],
+  "critical_code_review_comments": [
+    "seed() correctly re-syncs the admin password on every startup via update_one(...set: password_hash) when the stored hash doesn't verify against ADMIN_PASSWORD — this is the bug-fix promised in the request and matches auth playbook idempotent-admin pattern.",
+    "Every read/write in strategies, trades, alerts, notifications, tags, settings is scoped by {owner_id: user['id']} — no leaks were found. Cross-account by-id returns 404 (correct: 'not found for this owner', not 403 which would leak existence).",
+    "register() + admin create_user() both call seed_user_tags(uid) so a new workspace always starts with exactly 6 default tags — verified in test_register_creates_user_with_6_tags.",
+    "delete_user cascades across ['strategies','trades','alerts','notifications','tags','settings'] via delete_many({owner_id: uid}) — confirmed by trying to log back in as the deleted user (401).",
+    "delete_user guards against self-delete with 400 — verified.",
+    "Webhook /api/webhook/{token} correctly stamps owner_id from the strategy owner, so an alert created via a user's webhook lands only in that user's /api/alerts — verified.",
+    "server.py is now ~1070 lines. Same recurring feedback: consider splitting into routers/services. Not blocking."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_multitenancy.py (NEW: 14 tests covering admin login bug-fix, registration + 6 default tags, data isolation between accounts, admin user management, non-admin 403, webhook ownership)"
+  ],
+  "success_rate": {
+    "backend": "100% (57/57 = 43 regression + 14 new multi-tenancy)",
+    "frontend": "100% functional (login-register toggle, admin-only Users nav, Add User dialog + create + delete + You-label all working). Minor toast-overlap noted as design polish."
+  },
+  "test_credentials": "Admin: trader@tradehub.io / trade1234 (from /app/memory/test_credentials.md). Fresh users created per test with unique qauser+<hex>@example.com and deleted via admin DELETE afterwards.",
+  "seed_data_creation": "Each test in test_multitenancy.py registers ephemeral users via /api/auth/register and deletes them via admin DELETE /api/users/{id} in the fixture teardown. Stray users from earlier UI runs (qauser+ui776fde, trodrigs@gmail.com) were also cleaned up post-run. Admin bot/broker/mode reset to (auto_trade OFF, disconnected, paper) at the end.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Multi-tenancy + admin user management verified. Use /app/backend/tests/test_multitenancy.py alongside test_tradehub_api.py. Prefer serial `pytest -n 0` (43/43 regression + 14/14 new). For frontend automation of Users page, be aware the 'Welcome back' toast can transiently intercept the top-right new-user-btn — use dispatchEvent('click') or wait ~4s before clicking. Admin credentials trader@tradehub.io / trade1234. Always cleanup: DELETE any qauser+ test users via admin token, reset admin auto_trade OFF + broker disconnected + mode paper before finishing.",
+  "rca of the issue": "N/A — bug fix (idempotent admin password re-sync in seed()) and new feature (per-user owner_id scoping + admin management) both verified working. No regressions."
+}

@@ -8,8 +8,10 @@ import { Activity } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Login() {
-  const { login } = useAuth();
+  const { login, register } = useAuth();
   const nav = useNavigate();
+  const [mode, setMode] = useState("login");
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("trader@tradehub.io");
   const [password, setPassword] = useState("trade1234");
   const [loading, setLoading] = useState(false);
@@ -18,14 +20,25 @@ export default function Login() {
     e.preventDefault();
     setLoading(true);
     try {
-      await login(email, password);
-      toast.success("Welcome back");
+      if (mode === "login") {
+        await login(email, password);
+        toast.success("Welcome back");
+      } else {
+        await register(name || "Trader", email, password);
+        toast.success("Account created");
+      }
       nav("/");
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Login failed");
+      toast.error(err.response?.data?.detail || "Something went wrong");
     } finally {
       setLoading(false);
     }
+  };
+
+  const switchMode = (m) => {
+    setMode(m);
+    if (m === "register") { setEmail(""); setPassword(""); }
+    else { setEmail("trader@tradehub.io"); setPassword("trade1234"); }
   };
 
   return (
@@ -53,9 +66,18 @@ export default function Login() {
             <span className="font-heading font-black text-3xl tracking-tight">TradeHub</span>
           </div>
           <div>
-            <h1 className="font-heading font-bold text-2xl">Sign in</h1>
-            <p className="text-sm text-white/50 mt-1">Access your trading command center.</p>
+            <h1 className="font-heading font-bold text-2xl">{mode === "login" ? "Sign in" : "Create account"}</h1>
+            <p className="text-sm text-white/50 mt-1">
+              {mode === "login" ? "Access your trading command center." : "Start your own isolated trading workspace."}
+            </p>
           </div>
+          {mode === "register" && (
+            <div className="space-y-2">
+              <Label className="text-xs uppercase tracking-wider text-white/50">Name</Label>
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name"
+                className="bg-[#141414] border-white/10 text-white" data-testid="register-name" />
+            </div>
+          )}
           <div className="space-y-2">
             <Label className="text-xs uppercase tracking-wider text-white/50">Email</Label>
             <Input value={email} onChange={(e) => setEmail(e.target.value)}
@@ -68,8 +90,23 @@ export default function Login() {
           </div>
           <Button type="submit" disabled={loading}
             className="w-full bg-[#007AFF] hover:bg-[#3395FF] text-white font-semibold" data-testid="login-submit">
-            {loading ? "Signing in…" : "Sign In"}
+            {loading ? "Please wait…" : mode === "login" ? "Sign In" : "Create Account"}
           </Button>
+          <div className="text-center text-sm text-white/50">
+            {mode === "login" ? (
+              <>New here?{" "}
+                <button type="button" onClick={() => switchMode("register")} className="text-[#3395FF] hover:underline" data-testid="switch-to-register">
+                  Create an account
+                </button>
+              </>
+            ) : (
+              <>Already have an account?{" "}
+                <button type="button" onClick={() => switchMode("login")} className="text-[#3395FF] hover:underline" data-testid="switch-to-login">
+                  Sign in
+                </button>
+              </>
+            )}
+          </div>
         </form>
       </div>
     </div>

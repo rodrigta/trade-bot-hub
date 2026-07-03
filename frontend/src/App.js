@@ -12,6 +12,7 @@ import Bot from "@/pages/Bot";
 import Journal from "@/pages/Journal";
 import Analysis from "@/pages/Analysis";
 import Notifications from "@/pages/Notifications";
+import Users from "@/pages/Users";
 
 function Protected({ children }) {
   const { user, ready } = useAuth();
@@ -35,6 +36,7 @@ function App() {
               <Route path="/journal" element={<Journal />} />
               <Route path="/analysis" element={<Analysis />} />
               <Route path="/notifications" element={<Notifications />} />
+              <Route path="/users" element={<Users />} />
             </Route>
           </Routes>
         </BrowserRouter>
