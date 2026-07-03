@@ -1,0 +1,25 @@
+{
+  "summary": "Verified notification-independence refactor. Added TestNotificationIndependence class (4 tests) to /app/backend/tests/test_tradehub_api.py covering: (1) PAPER auto_execute logs '⚡ SIGNAL:' notif per platform + creates exactly 1 bot trade + alert 'executed'; (2) LIVE auto_execute with unreachable IBKR gateway still logs '⚡ SIGNAL:' notif, logs additional '⚠️ ORDER FAILED:' notif, sets alert status='failed' with execution.error populated & filled=False, creates ZERO trades; (3) require_approval webhook dispatches approval notif at receipt (no SIGNAL/ORDER-FAILED prefix), approve executes exactly 1 trade, double-approve returns 400 with no duplicate trade; (4) auto_approve_timer dispatches notif at receipt. Existing 29 regression tests still pass. Total: 33/33 green. Bot mode reset to paper post-run (verified via /api/bot/status → mode=paper, ibkr_connected=False).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_tradehub_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "receive_webhook() auto_execute branch correctly calls dispatch_notifications(..., prefix='⚡ SIGNAL: ') BEFORE execute_alert(); the notification log row is inserted independent of order fill outcome — verified.",
+    "execute_via_ibkr() live-mode gateway failure now returns {mode:'failed', filled:False, error:...} instead of silently paper-falling-back — verified via LIVE-mode test.",
+    "execute_alert() correctly (a) marks alert 'failed' + populates execution.error, (b) creates ZERO trades on failure, (c) sends '⚠️ ORDER FAILED:' notification — verified.",
+    "Pre-existing minor (unchanged from iteration_2): server.py is ~900 lines; consider modularising. auto_approve_timer uses in-process asyncio.create_task — pending-at-restart alerts won't auto-execute; a startup recovery scan is recommended."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_tradehub_api.py (added TestNotificationIndependence class with 4 tests)"
+  ],
+  "success_rate": {"backend": "100% (33/33)", "frontend": "skipped per request"},
+  "test_credentials": "trader@tradehub.io / trade1234 (from /app/memory/test_credentials.md, ADMIN_EMAIL/ADMIN_PASSWORD)",
+  "seed_data_creation": "Each new test creates a TEST_NI_* strategy scoped to unique symbols (NIPAPR, NILIVE, NIAPRV, NITIMR) and deletes the strategy in finally-blocks. Test residue trades/alerts remain under isolated symbols. Bot mode always reset to paper.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "33 backend tests in /app/backend/tests/test_tradehub_api.py. Notification-independence is verified end-to-end. IBKR live=unreachable in this env is EXPECTED and required for the LIVE-failure test to work; do not switch to a fake gateway. Telegram/Discord/Twilio outbound is MOCKED — notification log rows will show status='failed' without creds; that is EXPECTED, the test only asserts the LOG ROW exists with the correct prefix. Always reset bot mode to paper in finally blocks."
+}

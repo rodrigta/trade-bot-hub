@@ -186,6 +186,7 @@ export function StatusBadge({ status }) {
     approved: "bg-[#10B981]/15 text-[#10B981]",
     pending: "bg-[#F59E0B]/15 text-[#F59E0B]",
     rejected: "bg-[#EF4444]/15 text-[#EF4444]",
+    failed: "bg-[#EF4444]/15 text-[#EF4444]",
     received: "bg-[#3B82F6]/15 text-[#3B82F6]",
     ignored_paused: "bg-muted text-muted-foreground",
   };

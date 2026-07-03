@@ -167,18 +167,19 @@ async def get_settings() -> dict:
     s = await db.settings.find_one({"id": "global"}, {"_id": 0})
     return s or {"telegram": {}, "discord": {}, "whatsapp": {}, "ibkr": {}}
 
-async def send_telegram(text: str, alert_id: str, tg: dict) -> dict:
+async def send_telegram(text: str, alert_id: str, tg: dict, with_actions: bool = True) -> dict:
     token, chat = tg.get("bot_token"), tg.get("chat_id")
     if not token or not chat:
         return {"ok": False, "error": "not_configured"}
-    markup = {"inline_keyboard": [[
-        {"text": "✅ Approve", "callback_data": f"approve:{alert_id}"},
-        {"text": "❌ Reject", "callback_data": f"reject:{alert_id}"},
-    ]]}
+    payload = {"chat_id": chat, "text": text}
+    if with_actions:
+        payload["reply_markup"] = {"inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"approve:{alert_id}"},
+            {"text": "❌ Reject", "callback_data": f"reject:{alert_id}"},
+        ]]}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                             json={"chat_id": chat, "text": text, "reply_markup": markup})
+            r = await c.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
             return {"ok": r.status_code == 200, "status": r.status_code}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -207,13 +208,16 @@ async def send_whatsapp(text: str, wa: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-async def dispatch_notifications(strategy: dict, alert: dict):
+async def dispatch_notifications(strategy: dict, alert: dict, with_actions: bool = True, prefix: str = ""):
+    """Send the signal notification to all configured platforms. This runs
+    independently of (and before) order execution, so a notification is always
+    delivered even if the order later fails to fill."""
     settings = await get_settings()
-    msg = render_template(strategy.get("message_template", ""), alert)
+    msg = (prefix + render_template(strategy.get("message_template", ""), alert)).strip()
     platforms = strategy.get("notify_platforms", [])
     for plat in platforms:
         if plat == "telegram":
-            res = await send_telegram(msg, alert["id"], settings.get("telegram", {}))
+            res = await send_telegram(msg, alert["id"], settings.get("telegram", {}), with_actions=with_actions)
         elif plat == "discord":
             res = await send_discord(msg, settings.get("discord", {}))
         elif plat == "whatsapp":
@@ -260,7 +264,11 @@ async def execute_via_ibkr(alert: dict, ibkr_cfg: dict) -> dict:
             ib.disconnect()
             return {"mode": "live", "filled": True, "fill_price": fill_price}
         except Exception as e:
-            logger.warning(f"IBKR live failed, simulating: {e}")
+            # Live mode: a genuine gateway/order failure is reported as failed
+            # (no silent paper fill), so the trade can fail while the signal
+            # notification has already been delivered independently.
+            logger.warning(f"IBKR live order failed: {e}")
+            return {"mode": "failed", "filled": False, "error": str(e)}
     base = alert.get("price") or round(random.uniform(50, 400), 2)
     return {"mode": "paper", "filled": True, "fill_price": round(base, 2)}
 
@@ -268,9 +276,23 @@ async def execute_alert(alert_id: str):
     alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
     if not alert or alert["status"] not in ("pending", "approved"):
         return
-    strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
     settings = await get_settings()
-    result = await execute_via_ibkr(alert, settings.get("ibkr", {}))
+    try:
+        result = await execute_via_ibkr(alert, settings.get("ibkr", {}))
+    except Exception as e:
+        result = {"mode": "failed", "filled": False, "error": str(e)}
+
+    # Order failed to fill: mark the alert failed and stop. The signal
+    # notification was already sent at receipt, independent of this outcome.
+    if not result.get("filled"):
+        await db.alerts.update_one({"id": alert_id}, {"$set": {
+            "status": "failed", "failed_at": now_iso(), "execution": result}})
+        strategy = await db.strategies.find_one({"id": alert["strategy_id"]}, {"_id": 0})
+        if strategy:
+            await dispatch_notifications(strategy, alert, with_actions=False,
+                                         prefix="⚠️ ORDER FAILED: ")
+        return
+
     side = "long" if alert.get("action") in ("buy", "long") else "short"
     trade = {
         "id": new_id(), "symbol": alert["symbol"], "side": side,
@@ -409,6 +431,8 @@ async def receive_webhook(token: str, request: Request):
     if mode == "auto_execute":
         alert["status"] = "approved"
         await db.alerts.insert_one({**alert})
+        # Send the signal notification FIRST, independent of execution outcome.
+        await dispatch_notifications(strategy, alert, with_actions=False, prefix="⚡ SIGNAL: ")
         await execute_alert(alert["id"])
         return {"status": "executed", "alert_id": alert["id"]}
     else:

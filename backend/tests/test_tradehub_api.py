@@ -287,6 +287,150 @@ class TestWebhookFlow:
             client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
 
 
+# --- Notification independence (decoupled from execution) ------------------
+class TestNotificationIndependence:
+    def _make_strategy(self, client, mode, platforms=None, secs=2):
+        payload = {"name": f"TEST_NI_{mode}", "approval_mode": mode,
+                   "auto_approve_seconds": secs, "asset_type": "stock",
+                   "message_template": "{action} {symbol} @ {price}",
+                   "notify_platforms": platforms or ["telegram", "discord"],
+                   "active": True,
+                   "order_defaults": {"order_type": "market", "quantity": 1}}
+        r = client.post(f"{BASE_URL}/api/strategies", json=payload)
+        assert r.status_code == 200
+        return r.json()
+
+    def test_auto_execute_paper_logs_signal_and_creates_trade(self, client):
+        """PAPER MODE SUCCESS: '⚡ SIGNAL' notification logged AND 1 bot trade AND alert 'executed'."""
+        # ensure paper mode
+        client.post(f"{BASE_URL}/api/bot/mode", json={"live": False})
+        s = self._make_strategy(client, "auto_execute",
+                                platforms=["telegram", "discord"])
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "buy", "symbol": "NIPAPR", "quantity": 2, "price": 42.0},
+                timeout=20)
+            assert r.status_code == 200
+            assert r.json()["status"] == "executed"
+            aid = r.json()["alert_id"]
+
+            # notifications: at least one per platform prefixed '⚡ SIGNAL:'
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            signal_rows = [n for n in notifs if n.get("alert_id") == aid
+                           and n.get("message", "").startswith("⚡ SIGNAL:")]
+            plats = {n["platform"] for n in signal_rows}
+            assert "telegram" in plats and "discord" in plats, f"platforms={plats}"
+
+            # exactly one trade
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=NIPAPR").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 1
+            assert linked[0]["source"] == "bot"
+
+            # alert status executed
+            alerts = client.get(f"{BASE_URL}/api/alerts").json()
+            target = next((a for a in alerts if a["id"] == aid), None)
+            assert target and target["status"] == "executed"
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+    def test_auto_execute_live_failure_logs_signal_and_order_failed(self, client):
+        """LIVE MODE FAILURE: '⚡ SIGNAL' logged, alert 'failed' w/ execution.error,
+        ZERO trades, additional '⚠️ ORDER FAILED' notification present."""
+        # switch to live; IBKR gateway unreachable in this env
+        m = client.post(f"{BASE_URL}/api/bot/mode", json={"live": True})
+        assert m.status_code == 200 and m.json()["mode"] == "live"
+        s = self._make_strategy(client, "auto_execute",
+                                platforms=["telegram", "discord"])
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "buy", "symbol": "NILIVE", "quantity": 3, "price": 55.0},
+                timeout=30)
+            assert r.status_code == 200
+            aid = r.json()["alert_id"]
+
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            row = [n for n in notifs if n.get("alert_id") == aid]
+            signal_rows = [n for n in row if n["message"].startswith("⚡ SIGNAL:")]
+            failed_rows = [n for n in row if n["message"].startswith("⚠️ ORDER FAILED:")]
+            assert len(signal_rows) >= 1, "signal notif must be logged independent of exec"
+            assert len(failed_rows) >= 1, "order-failed notif must be logged"
+
+            # zero trades in live failure
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=NILIVE").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 0, f"expected 0 trades in live-failure, found {len(linked)}"
+
+            # alert status 'failed' with execution.error populated
+            alerts = client.get(f"{BASE_URL}/api/alerts").json()
+            target = next((a for a in alerts if a["id"] == aid), None)
+            assert target is not None
+            assert target["status"] == "failed", f"got {target['status']}"
+            assert target.get("execution", {}).get("error"), "execution.error must be set"
+            assert target["execution"].get("filled") is False
+        finally:
+            # RESET to paper regardless
+            client.post(f"{BASE_URL}/api/bot/mode", json={"live": False})
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+    def test_require_approval_dispatches_approval_notification_before_execution(self, client):
+        """require_approval webhook creates pending alert and dispatches
+        approval-request notification (no SIGNAL/ORDER FAILED prefix) at receipt."""
+        client.post(f"{BASE_URL}/api/bot/mode", json={"live": False})
+        s = self._make_strategy(client, "require_approval",
+                                platforms=["telegram"])
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "buy", "symbol": "NIAPRV", "quantity": 1, "price": 10.0},
+                timeout=20)
+            assert r.json()["status"] == "pending_approval"
+            aid = r.json()["alert_id"]
+
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            rows = [n for n in notifs if n.get("alert_id") == aid]
+            assert len(rows) >= 1, "approval notification must be dispatched"
+            # These approval notifications should NOT have SIGNAL/ORDER FAILED prefix
+            assert not any(n["message"].startswith("⚡ SIGNAL:") for n in rows)
+            assert not any(n["message"].startswith("⚠️ ORDER FAILED:") for n in rows)
+
+            # Approving executes exactly one trade
+            ap = client.post(f"{BASE_URL}/api/alerts/{aid}/approve")
+            assert ap.status_code == 200 and ap.json()["status"] == "executed"
+            trades = client.get(f"{BASE_URL}/api/trades?symbol=NIAPRV").json()
+            linked = [t for t in trades if t.get("alert_id") == aid]
+            assert len(linked) == 1
+
+            # Double approve guard still 400 and no duplicate trade
+            ap2 = client.post(f"{BASE_URL}/api/alerts/{aid}/approve")
+            assert ap2.status_code == 400
+            trades2 = client.get(f"{BASE_URL}/api/trades?symbol=NIAPRV").json()
+            linked2 = [t for t in trades2 if t.get("alert_id") == aid]
+            assert len(linked2) == 1
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+    def test_auto_approve_timer_dispatches_notification_at_receipt(self, client):
+        client.post(f"{BASE_URL}/api/bot/mode", json={"live": False})
+        s = self._make_strategy(client, "auto_approve_timer",
+                                platforms=["discord"], secs=2)
+        try:
+            r = requests.post(
+                f"{BASE_URL}/api/webhook/{s['webhook_token']}",
+                json={"action": "buy", "symbol": "NITIMR", "quantity": 1, "price": 8.0},
+                timeout=20)
+            assert r.json()["status"] == "pending_approval"
+            aid = r.json()["alert_id"]
+            # notification recorded immediately at receipt
+            notifs = client.get(f"{BASE_URL}/api/notifications").json()
+            rows = [n for n in notifs if n.get("alert_id") == aid]
+            assert len(rows) >= 1
+        finally:
+            client.delete(f"{BASE_URL}/api/strategies/{s['id']}")
+
+
 # --- Trades / Journal -------------------------------------------------------
 class TestTrades:
     def test_list_filters(self, client):
