@@ -20,6 +20,7 @@ Single-user automated trading bot + strategy manager + approval/notification lay
 - Notification independence: signal notification fires on every alert, independent of order execution; order_success/order_failure notifications after fills ✓
 - Auto-Trade master switch (default OFF): when OFF all signals are held for manual approval; broker connect/disconnect (IBKR host/port) on Bot page ✓
 - Telegram personal + group targets (separate bot token each); per-platform notification-event filter (signal / order filled / order failed); Send Test button per platform ✓
+- Multi-tenancy: per-user isolated data (owner_id scoping on all collections); JWT self-registration + admin-managed Users panel (create/delete); non-admin 403 on user mgmt; new users get 6 default tags; idempotent admin password re-sync from env on startup ✓
 - Phase 2 Strategies Manager: full CRUD, auto webhook endpoints, approval modes, notification multi-select, order defaults, list cards + detail ✓
 - Phase 3 Approval/Notification: pending alerts, in-app approval center w/ live countdowns, auto-approve timers, Telegram/Discord/WhatsApp outbound + Telegram callback + Twilio reply webhooks, notification log ✓
 - Phase 4 Trading Bot: strategy-aware webhook routing, alert parsing, IBKR exec (sim fallback), paper/live toggle, bot dashboard + execution log, alert status tracking ✓

@@ -40,7 +40,7 @@ function App() {
             </Route>
           </Routes>
         </BrowserRouter>
-        <Toaster position="top-right" richColors theme="dark" />
+        <Toaster position="top-right" richColors theme="dark" duration={2500} />
       </AuthProvider>
     </ThemeProvider>
   );
