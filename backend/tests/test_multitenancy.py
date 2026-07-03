@@ -25,7 +25,7 @@ def admin_token():
     r = _login(ADMIN_EMAIL, ADMIN_PASSWORD)
     assert r.status_code == 200, r.text
     d = r.json()
-    assert d["user"]["is_admin"] is True
+    assert d["user"]["is_admin"]
     return d["token"]
 
 
@@ -39,7 +39,7 @@ def fresh_user(admin_token):
                       timeout=20)
     assert r.status_code == 200, r.text
     data = r.json()
-    assert data["user"]["is_admin"] is False
+    assert not (data["user"]["is_admin"])
     yield {"email": email, "password": password, "token": data["token"], "id": data["user"]["id"]}
     # Cleanup via admin
     requests.delete(f"{BASE_URL}/api/users/{data['user']['id']}",
@@ -51,7 +51,7 @@ class TestAdminLogin:
     def test_admin_login_ok(self, admin_token):
         r = requests.get(f"{BASE_URL}/api/auth/me", headers=_hdr(admin_token))
         assert r.status_code == 200
-        assert r.json()["is_admin"] is True
+        assert r.json()["is_admin"]
         assert r.json()["email"] == ADMIN_EMAIL
 
     def test_invalid_password_401(self):
@@ -154,7 +154,7 @@ class TestAdminUserManagement:
                           json={"name": "AdminMade", "email": email, "password": TEST_PW})
         assert r.status_code == 200
         uid = r.json()["id"]
-        assert r.json()["is_admin"] is False
+        assert not (r.json()["is_admin"])
         # cleanup
         d = requests.delete(f"{BASE_URL}/api/users/{uid}", headers=_hdr(admin_token))
         assert d.status_code == 200

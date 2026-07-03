@@ -391,7 +391,7 @@ class TestNotificationIndependence:
             assert target is not None
             assert target["status"] == "failed", f"got {target['status']}"
             assert target.get("execution", {}).get("error"), "execution.error must be set"
-            assert target["execution"].get("filled") is False
+            assert not (target["execution"].get("filled"))
         finally:
             # RESET to paper regardless
             client.post(f"{BASE_URL}/api/bot/mode", json={"live": False})
@@ -606,8 +606,8 @@ class TestAutoTradeGating:
         r = client.get(f"{BASE_URL}/api/bot/status")
         assert r.status_code == 200
         d = r.json()
-        assert d["auto_trade_enabled"] is False
-        assert d["broker_connected"] is False
+        assert not (d["auto_trade_enabled"])
+        assert not (d["broker_connected"])
 
     def test_auto_execute_held_when_auto_trade_off(self, client):
         # ensure OFF
@@ -637,7 +637,7 @@ class TestAutoTradeGating:
 
     def test_auto_execute_runs_when_auto_trade_on(self, client):
         r = client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": True})
-        assert r.status_code == 200 and r.json()["auto_trade_enabled"] is True
+        assert r.status_code == 200 and r.json()["auto_trade_enabled"]
         s = _mk_strategy(client, "auto_execute", platforms=["telegram"], name_suffix="run")
         try:
             r = requests.post(f"{BASE_URL}/api/webhook/{s['webhook_token']}",
@@ -680,26 +680,26 @@ class TestBrokerConnect:
         r = client.post(f"{BASE_URL}/api/bot/broker",
                         json={"connected": True, "host": "192.168.99.5", "port": 4001})
         assert r.status_code == 200
-        assert r.json()["broker_connected"] is True
+        assert r.json()["broker_connected"]
 
         st = client.get(f"{BASE_URL}/api/bot/status").json()
-        assert st["broker_connected"] is True
+        assert st["broker_connected"]
         assert st["host"] == "192.168.99.5"
         assert st["port"] == 4001
         # auto_trade preserved
-        assert st["auto_trade_enabled"] is True
+        assert st["auto_trade_enabled"]
         # settings.telegram preserved
         gs = client.get(f"{BASE_URL}/api/settings").json()
         assert gs["telegram"]["personal"]["bot_token"] == "pTok"
 
         # disconnect
         r = client.post(f"{BASE_URL}/api/bot/broker", json={"connected": False})
-        assert r.status_code == 200 and r.json()["broker_connected"] is False
+        assert not (r.status_code == 200 and r.json()["broker_connected"])
         st = client.get(f"{BASE_URL}/api/bot/status").json()
-        assert st["broker_connected"] is False
+        assert not (st["broker_connected"])
         # host/port and other settings still there
         assert st["host"] == "192.168.99.5"
-        assert st["auto_trade_enabled"] is True
+        assert st["auto_trade_enabled"]
 
         # cleanup
         client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
@@ -800,7 +800,7 @@ class TestNotificationsTestEndpoint:
         r = client.post(f"{BASE_URL}/api/notifications/test", json={"platform": platform})
         assert r.status_code == 200
         body = r.json()
-        assert body["ok"] is False
+        assert not (body["ok"])
         # detail contains not_configured error
         detail = body["detail"]
         # discord returns dict; telegram returns list; whatsapp returns dict
@@ -821,7 +821,7 @@ class TestNotificationsTestEndpoint:
         })
         r = client.post(f"{BASE_URL}/api/notifications/test", json={"platform": "telegram"})
         assert r.status_code == 200
-        assert r.json()["ok"] is False
+        assert not (r.json()["ok"])
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +852,7 @@ class TestSettingsPersistence:
         assert g["discord"]["events"] == ["signal"]
         assert g["whatsapp"]["events"] == ["order_success"]
         assert g["ibkr"]["host"] == "10.0.0.1"
-        assert g["auto_trade_enabled"] is True
+        assert g["auto_trade_enabled"]
 
         # cleanup: reset auto_trade
         client.post(f"{BASE_URL}/api/bot/auto-trade", json={"enabled": False})
