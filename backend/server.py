@@ -889,13 +889,23 @@ SETUP_TAGS = [
 ]
 
 async def seed():
-    if await db.users.count_documents({}) == 0:
+    # Idempotent admin seeding: create the login user if missing, and always
+    # sync its password to ADMIN_PASSWORD from env so a changed/rotated secret
+    # (e.g. after a redeploy) takes effect on startup instead of failing login.
+    admin_email = os.environ["ADMIN_EMAIL"].lower()
+    admin_password = os.environ["ADMIN_PASSWORD"]
+    existing = await db.users.find_one({"email": admin_email})
+    if existing is None:
         await db.users.insert_one({
-            "id": new_id(), "email": os.environ["ADMIN_EMAIL"].lower(),
-            "password_hash": hash_password(os.environ["ADMIN_PASSWORD"]),
+            "id": new_id(), "email": admin_email,
+            "password_hash": hash_password(admin_password),
             "name": "Trader", "created_at": now_iso(),
         })
         logger.info("Seeded admin user")
+    elif not verify_password(admin_password, existing["password_hash"]):
+        await db.users.update_one({"email": admin_email},
+                                  {"$set": {"password_hash": hash_password(admin_password)}})
+        logger.info("Admin password re-synced from env")
 
     if await db.tags.count_documents({}) == 0:
         for t in SETUP_TAGS:
